@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "projects": [
+    {
+      "name": "Project1",
+      "path": "Project1",
+      "description": "ESP32 DS18B20 to IoT backend ingestion smoke test",
+      "board": "esp32dev",
+      "platform": "espressif32",
+      "framework": "arduino",
+      "defaultEnv": "esp32dev"
+    },
+    {
+      "name": "Project2",
+      "path": "Project2",
+      "description": "ESP8266 NodeMCU basic blink smoke test",
+      "board": "nodemcuv2",
+      "platform": "espressif8266",
+      "framework": "arduino",
+      "defaultEnv": "nodemcuv2"
+    },
+    {
+      "name": "Project3-ColdRoom-TempMonitor",
+      "path": "Project3-ColdRoom-TempMonitor",
+      "description": "ESP32 cold-room monitoring with 2x DS18B20 on one 1-wire bus",
+      "board": "esp32dev",
+      "platform": "espressif32",
+      "framework": "arduino",
+      "defaultEnv": "esp32dev"
+    }
+  ]
+}
