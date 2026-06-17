@@ -746,6 +746,8 @@ void BbhIotFirmwareCore::publishRuntimeStatus(const char* state) {
   doc["firmware_version"] = config_.firmwareVersion;
   doc["ip_address"] = WiFi.localIP().toString();
   doc["device_key"] = deviceKey_;
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["uptime_seconds"] = millis() / 1000UL;
 
   String payload;
   serializeJson(doc, payload);

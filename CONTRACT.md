@@ -93,22 +93,25 @@ Ingestion dedups on **either** unique index:
 
 ## Status payload (device → `…/status`)
 
-What the firmware currently sends:
+What the firmware sends:
 
 ```json
 {
   "state": "online",
   "firmware_version": "coldroom-temp-1.0.0",
   "ip_address": "10.24.16.41",
-  "device_key": "coldroom-temp-001"
+  "device_key": "coldroom-temp-001",
+  "wifi_rssi": -63,
+  "uptime_seconds": 381240
 }
 ```
 
-The backend currently only extracts `ip_address` and updates the heartbeat timestamp;
-`wifi_rssi` / `uptime_seconds` / `firmware_version` / `state` are not yet persisted from
-status messages (a known backend gap — see audit). Devices **should** include
-`wifi_rssi` and `uptime_seconds` so the backend can start storing them without a firmware
-change.
+The backend parses the JSON heartbeat and persists `ip_address`, `firmware_version`,
+`wifi_rssi`, and `uptime_seconds` onto `iot_devices` (columns `ip_address`,
+`firmware_version`, `last_wifi_rssi`, `last_uptime_seconds`, `last_status_at`), in addition
+to refreshing the heartbeat timestamps. Fields are updated with `COALESCE`, so a partial or
+plain-text heartbeat never clears previously stored values. `state` is not persisted —
+online/offline is still derived server-side from `last_seen` + `offline_after_minutes`.
 
 ## Bootstrap / claim flow
 
