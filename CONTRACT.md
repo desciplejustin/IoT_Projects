@@ -52,6 +52,7 @@ Notes:
 {
   "message_id": "coldroom-temp-001-7-000044",
   "firmware_version": "coldroom-temp-1.0.0",
+  "reading_time": "2026-06-18T09:21:04Z",
   "readings": [
     { "sensor_key": "probe_1", "value": 24.6, "unit": "C" },
     { "sensor_key": "probe_2", "value": 25.1, "unit": "C" }
@@ -74,9 +75,20 @@ Rules:
   `message_id = {device_key}-{boot_seq}-{counter}` where `boot_seq` is stored in NVS and
   incremented every boot. **Never ship a `message_id` whose counter restarts at boot
   without a per-boot prefix** — it causes silent post-reboot data loss.
-- Optional `reading_time` (ISO 8601) may be sent **only** when the device has reliable
-  clock sync (NTP/RTC). The field name is exactly `reading_time` (the planning doc's
-  `recorded_at` is wrong). When absent, the backend stamps server receive time.
+- Optional `reading_time` (ISO 8601, UTC) is sent **only** when the device has reliable
+  clock sync. The field name is exactly `reading_time` (the planning doc's `recorded_at`
+  is wrong). The firmware syncs time via NTP (`pool.ntp.org`) and stamps each record when
+  the sample is taken; if NTP has not yet resolved, the field is omitted and the backend
+  stamps server receive time.
+
+### Offline buffering (store-and-forward)
+
+The firmware does not drop telemetry while MQTT is unavailable. Each sample is written to a
+bounded persistent ring buffer in flash (LittleFS, ~512 records) and flushed oldest-first on
+reconnect. Because `message_id` and `reading_time` are assigned when the sample is taken and
+stored with the record, buffered readings keep their original identity and timestamp through
+the outage and across reboots — so the backend dedups and time-orders them correctly on
+flush. When the buffer is full the oldest record is dropped to make room for the newest.
 
 ### Canonical units
 

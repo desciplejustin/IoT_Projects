@@ -93,6 +93,8 @@ class BbhIotFirmwareCore {
   static constexpr size_t kLocationHintMax = 64;
   static constexpr size_t kProtocolMax = 16;
   static constexpr size_t kSensorJsonMax = 1024;
+  static constexpr size_t kTelemetrySlotSize = 512;
+  static constexpr uint16_t kTelemetryBufferCapacity = 512;
 
   enum DeviceMode {
     DEVICE_MODE_BOOTSTRAP,
@@ -126,7 +128,17 @@ class BbhIotFirmwareCore {
   void publishBootstrapClaim();
   bool applyApprovedConfig(JsonDocument& doc);
   void publishRuntimeStatus(const char* state);
-  bool publishRuntimeTelemetry();
+  bool buildTelemetryRecord(String& outJson);
+  bool publishTelemetryRecord(const String& json);
+  void drainTelemetryBuffer(size_t maxRecords);
+  void initTelemetryBuffer();
+  bool telemetryBufferEnqueue(const String& json);
+  bool telemetryBufferPeek(String& outJson);
+  void telemetryBufferPopFront();
+  void persistTelemetryBufferMeta();
+  void syncTimeIfNeeded();
+  bool isTimeValid();
+  String currentIso8601();
   void updateRuntimeOfflineWill();
   void ensureLocalServer();
   void clearProvisioningAndRestart();
@@ -218,4 +230,9 @@ class BbhIotFirmwareCore {
   size_t sensorDefCount_;
   BbhTelemetryReading latestReadings_[kMaxSensors];
   size_t latestReadingCount_;
+  bool fsReady_;
+  bool timeValid_;
+  bool ntpConfigured_;
+  uint16_t tbHead_;
+  uint16_t tbCount_;
 };

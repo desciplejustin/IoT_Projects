@@ -1,5 +1,13 @@
 #include "BBHIotFirmwareCore.h"
 
+#include <LittleFS.h>
+#include <time.h>
+
+namespace {
+constexpr const char* kTelemetryBufferPath = "/tbuf.bin";
+constexpr time_t kMinValidEpoch = 1700000000;  // ~2023-11, sanity floor for NTP sync
+}  // namespace
+
 BbhIotFirmwareCore* BbhIotFirmwareCore::activeInstance = nullptr;
 
 namespace {
@@ -117,7 +125,12 @@ BbhIotFirmwareCore::BbhIotFirmwareCore(
       expectedIntervalMinutes_(0),
       offlineAfterMinutes_(0),
       sensorDefCount_(0),
-      latestReadingCount_(0) {
+      latestReadingCount_(0),
+      fsReady_(false),
+      timeValid_(false),
+      ntpConfigured_(false),
+      tbHead_(0),
+      tbCount_(0) {
   bootstrapBrokerHost_[0] = '\0';
   bootstrapUsername_[0] = '\0';
   bootstrapPassword_[0] = '\0';
@@ -145,6 +158,7 @@ void BbhIotFirmwareCore::setup() {
   initializeSensorDefinitions();
   loadRuntimeConfig();
   loadAndIncrementBootSeq();
+  initTelemetryBuffer();
   deviceMode_ = hasFinalConfig() ? DEVICE_MODE_RUNTIME : DEVICE_MODE_BOOTSTRAP;
 
   sensorAdapter_.begin();
@@ -178,6 +192,7 @@ void BbhIotFirmwareCore::loop() {
 
   if (WiFi.status() == WL_CONNECTED) {
     ensureLocalServer();
+    syncTimeIfNeeded();
     if (deviceMode_ == DEVICE_MODE_RUNTIME) {
       connectRuntimeMqtt();
     } else {
@@ -205,12 +220,24 @@ void BbhIotFirmwareCore::loop() {
   }
 
   if (millis() - lastTelemetryAt_ >= config_.timing.telemetryIntervalMs) {
-    if (mqtt_.connected()) {
-      publishRuntimeTelemetry();
-    } else {
-      logEvent("Skipping telemetry: runtime MQTT not connected.");
+    String record;
+    if (buildTelemetryRecord(record)) {
+      // Send live only when online AND the backlog is already empty, so buffered
+      // records always drain in chronological (FIFO) order.
+      bool sentLive = mqtt_.connected() && tbCount_ == 0 && publishTelemetryRecord(record);
+      if (sentLive) {
+        lastPublishSummary_ = "telemetry: ok";
+      } else if (telemetryBufferEnqueue(record)) {
+        lastPublishSummary_ = String("telemetry: buffered (") + tbCount_ + " queued)";
+      } else {
+        lastPublishSummary_ = "telemetry: buffer unavailable, dropped";
+      }
     }
     lastTelemetryAt_ = millis();
+  }
+
+  if (mqtt_.connected()) {
+    drainTelemetryBuffer(5);
   }
 }
 
@@ -766,15 +793,14 @@ void BbhIotFirmwareCore::updateRuntimeOfflineWill() {
   mqtt_.setWill(runtimeStatusTopic_, payload.c_str(), false, runtimeQos_);
 }
 
-bool BbhIotFirmwareCore::publishRuntimeTelemetry() {
-  if (!mqtt_.connected() || !hasFinalConfig()) {
+bool BbhIotFirmwareCore::buildTelemetryRecord(String& outJson) {
+  if (!hasFinalConfig()) {
     return false;
   }
 
   captureLatestReadings();
   if (latestReadingCount_ == 0) {
     logEvent("Skipping telemetry: no valid sensor readings available.");
-    lastPublishSummary_ = "telemetry: skipped";
     return false;
   }
 
@@ -789,6 +815,11 @@ bool BbhIotFirmwareCore::publishRuntimeTelemetry() {
       static_cast<unsigned long>(++runtimeMessageCounter_));
   doc["message_id"] = messageId;
   doc["firmware_version"] = config_.firmwareVersion;
+  // Stamp the reading time now, while the sample is fresh, so a record that gets
+  // buffered during an outage keeps its true timestamp instead of the flush time.
+  if (isTimeValid()) {
+    doc["reading_time"] = currentIso8601();
+  }
 
   JsonArray readings = doc["readings"].to<JsonArray>();
   size_t publishedCount = 0;
@@ -805,15 +836,205 @@ bool BbhIotFirmwareCore::publishRuntimeTelemetry() {
 
   if (publishedCount == 0) {
     logEvent("Skipping telemetry: all sensor readings invalid.");
-    lastPublishSummary_ = "telemetry: skipped";
     return false;
   }
 
-  String payload;
-  serializeJson(doc, payload);
-  bool ok = mqtt_.publish(String(runtimeTelemetryTopic_), payload, false, runtimeQos_);
-  lastPublishSummary_ = String("telemetry: ") + (ok ? "ok" : "failed");
-  return ok;
+  outJson = "";
+  serializeJson(doc, outJson);
+  return true;
+}
+
+bool BbhIotFirmwareCore::publishTelemetryRecord(const String& json) {
+  if (!mqtt_.connected() || !hasFinalConfig()) {
+    return false;
+  }
+  return mqtt_.publish(String(runtimeTelemetryTopic_), json, false, runtimeQos_);
+}
+
+void BbhIotFirmwareCore::drainTelemetryBuffer(size_t maxRecords) {
+  if (!mqtt_.connected() || !hasFinalConfig()) {
+    return;
+  }
+
+  size_t sent = 0;
+  while (tbCount_ > 0 && sent < maxRecords) {
+    String json;
+    if (!telemetryBufferPeek(json)) {
+      // Unreadable slot: drop it so the queue can make progress.
+      logEvent("Dropping unreadable buffered telemetry record.");
+      telemetryBufferPopFront();
+      continue;
+    }
+    if (!publishTelemetryRecord(json)) {
+      break;  // Stay buffered and retry on a later loop.
+    }
+    telemetryBufferPopFront();
+    sent++;
+  }
+
+  if (sent > 0) {
+    lastPublishSummary_ = String("telemetry: flushed ") + sent + ", " + tbCount_ + " queued";
+    logEvent(String("Flushed ") + sent + " buffered record(s); " + tbCount_ + " remaining.");
+  }
+}
+
+void BbhIotFirmwareCore::initTelemetryBuffer() {
+  tbHead_ = 0;
+  tbCount_ = 0;
+  fsReady_ = LittleFS.begin(true);  // format on first use / mount failure
+  if (!fsReady_) {
+    logEvent("LittleFS mount failed; telemetry buffering disabled.");
+    return;
+  }
+
+  // Pre-size the ring file so every slot seek/write stays within the file.
+  File f = LittleFS.open(kTelemetryBufferPath, LittleFS.exists(kTelemetryBufferPath) ? "r+" : "w+");
+  if (f) {
+    uint32_t needed = static_cast<uint32_t>(kTelemetryBufferCapacity) * kTelemetrySlotSize;
+    if (f.size() < needed) {
+      f.seek(needed - 1);
+      uint8_t zero = 0;
+      f.write(&zero, 1);
+    }
+    f.close();
+  } else {
+    fsReady_ = false;
+    logEvent("Telemetry buffer file open failed; buffering disabled.");
+    return;
+  }
+
+  configStore_.begin("coldroom", true);
+  tbHead_ = configStore_.getUShort("tb_head", 0);
+  tbCount_ = configStore_.getUShort("tb_count", 0);
+  configStore_.end();
+  if (tbHead_ >= kTelemetryBufferCapacity) {
+    tbHead_ = 0;
+  }
+  if (tbCount_ > kTelemetryBufferCapacity) {
+    tbCount_ = kTelemetryBufferCapacity;
+  }
+  logEvent(String("Telemetry buffer ready (") + tbCount_ + " queued).");
+}
+
+void BbhIotFirmwareCore::persistTelemetryBufferMeta() {
+  configStore_.begin("coldroom", false);
+  configStore_.putUShort("tb_head", tbHead_);
+  configStore_.putUShort("tb_count", tbCount_);
+  configStore_.end();
+}
+
+bool BbhIotFirmwareCore::telemetryBufferEnqueue(const String& json) {
+  if (!fsReady_) {
+    return false;
+  }
+  if (json.length() + 2 > kTelemetrySlotSize) {
+    logEvent("Telemetry record exceeds slot size; dropped.");
+    return false;
+  }
+
+  if (tbCount_ >= kTelemetryBufferCapacity) {
+    // Bounded ring: discard the oldest record to make room for the newest.
+    tbHead_ = (tbHead_ + 1) % kTelemetryBufferCapacity;
+    tbCount_--;
+    logEvent("Telemetry buffer full; dropped oldest record.");
+  }
+
+  uint16_t tail = (tbHead_ + tbCount_) % kTelemetryBufferCapacity;
+  File f = LittleFS.open(kTelemetryBufferPath, "r+");
+  if (!f) {
+    logEvent("Telemetry buffer open failed (enqueue).");
+    return false;
+  }
+  if (!f.seek(static_cast<uint32_t>(tail) * kTelemetrySlotSize)) {
+    f.close();
+    return false;
+  }
+  uint16_t len = static_cast<uint16_t>(json.length());
+  uint8_t lenBytes[2] = {static_cast<uint8_t>(len & 0xFF), static_cast<uint8_t>((len >> 8) & 0xFF)};
+  f.write(lenBytes, 2);
+  f.write(reinterpret_cast<const uint8_t*>(json.c_str()), len);
+  f.close();
+
+  tbCount_++;
+  persistTelemetryBufferMeta();
+  return true;
+}
+
+bool BbhIotFirmwareCore::telemetryBufferPeek(String& outJson) {
+  if (!fsReady_ || tbCount_ == 0) {
+    return false;
+  }
+
+  File f = LittleFS.open(kTelemetryBufferPath, "r");
+  if (!f) {
+    return false;
+  }
+  if (!f.seek(static_cast<uint32_t>(tbHead_) * kTelemetrySlotSize)) {
+    f.close();
+    return false;
+  }
+  uint8_t lenBytes[2];
+  if (f.read(lenBytes, 2) != 2) {
+    f.close();
+    return false;
+  }
+  uint16_t len = static_cast<uint16_t>(lenBytes[0] | (lenBytes[1] << 8));
+  if (len == 0 || static_cast<size_t>(len) + 2 > kTelemetrySlotSize) {
+    f.close();
+    return false;
+  }
+  char buf[kTelemetrySlotSize];
+  int got = f.read(reinterpret_cast<uint8_t*>(buf), len);
+  f.close();
+  if (got != static_cast<int>(len)) {
+    return false;
+  }
+  buf[len] = '\0';
+  outJson = String(buf);
+  return true;
+}
+
+void BbhIotFirmwareCore::telemetryBufferPopFront() {
+  if (tbCount_ == 0) {
+    return;
+  }
+  tbHead_ = (tbHead_ + 1) % kTelemetryBufferCapacity;
+  tbCount_--;
+  persistTelemetryBufferMeta();
+}
+
+void BbhIotFirmwareCore::syncTimeIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (!ntpConfigured_) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // UTC; reading_time is UTC
+    ntpConfigured_ = true;
+    logEvent("NTP time sync started (UTC).");
+  }
+  if (!timeValid_ && time(nullptr) > kMinValidEpoch) {
+    timeValid_ = true;
+    logEvent("NTP time acquired.");
+  }
+}
+
+bool BbhIotFirmwareCore::isTimeValid() {
+  if (timeValid_) {
+    return true;
+  }
+  if (time(nullptr) > kMinValidEpoch) {
+    timeValid_ = true;
+  }
+  return timeValid_;
+}
+
+String BbhIotFirmwareCore::currentIso8601() {
+  time_t now = time(nullptr);
+  struct tm tmInfo;
+  gmtime_r(&now, &tmInfo);
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmInfo);
+  return String(buf);
 }
 
 void BbhIotFirmwareCore::onMqttMessage(String& topic, String& payload) {
@@ -1003,6 +1224,8 @@ void BbhIotFirmwareCore::handleLocalStatusPage() {
   html += "<tr><td>MQTT</td><td><span class='pill " + String(mqtt_.connected() ? "ok" : "bad") + "'>" + String(mqtt_.connected() ? "connected" : "disconnected") + "</span></td></tr>";
   html += "<tr><td>IP Address</td><td>" + WiFi.localIP().toString() + "</td></tr>";
   html += "<tr><td>Last Publish</td><td>" + htmlEscape(lastPublishSummary_) + "</td></tr>";
+  html += "<tr><td>Buffered Telemetry</td><td>" + String(tbCount_) + "</td></tr>";
+  html += "<tr><td>Time Synced</td><td>" + String(isTimeValid() ? "yes (UTC)" : "no") + "</td></tr>";
   html += "<tr><td>Uptime</td><td>" + formatUptimeDhM(millis()) + "</td></tr>";
   html += "</table></div>";
 
@@ -1089,6 +1312,8 @@ void BbhIotFirmwareCore::handleLocalStatusJson() {
   doc["last_bootstrap_status"] = lastBootstrapStatus_;
   doc["claim_id"] = lastClaimId_;
   doc["uptime_ms"] = millis();
+  doc["buffered_telemetry"] = tbCount_;
+  doc["time_valid"] = isTimeValid();
 
   JsonArray sensors = doc["sensors"].to<JsonArray>();
   for (size_t i = 0; i < sensorDefCount_; i++) {
