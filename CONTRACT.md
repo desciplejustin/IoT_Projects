@@ -31,16 +31,20 @@ the `bbh-app25.03` backend. It is derived from the running code on both sides:
 |---|---|---|---|
 | `{prefix}/{device_key}/telemetry` | device → backend | no | sensor readings |
 | `{prefix}/{device_key}/status`    | device → backend | no | JSON heartbeat |
-| `{prefix}/{device_key}/command`   | backend → device | — | reserved (not yet consumed by firmware) |
+| `{prefix}/{device_key}/command`   | backend → device | no | actuator commands (see Actuator control) |
+| `{prefix}/{device_key}/state`     | device → backend | yes (recommended) | actuator state reports |
 | `{prefix}/{device_key}/config`    | backend → device | — | reserved (not yet consumed by firmware) |
 | `bbh/iot/bootstrap/claim`         | device → backend | no | unprovisioned device claim |
 | `bbh/iot/bootstrap/reply/{hardware_id}` | backend → device | see note | claim status / approved config |
 
 Notes:
 
-- **There is no `state` topic and no `ota` topic in the current system.** Availability is
-  computed server-side from `iot_devices.last_seen` + `offline_after_minutes`. (An earlier
-  spec called for a retained `state` topic; it was never implemented on either side.)
+- **There is no `ota` topic yet.** Device availability (online/offline) is computed
+  server-side from `iot_devices.last_seen` + `offline_after_minutes` — the `state` topic is
+  for **actuator** state, not device availability.
+- The `command` and `state` topics are consumed by the backend now (for switches/relays),
+  but the **device firmware does not yet act on commands or publish state** — that is the
+  pending actuator-firmware work. Until then commands publish but go unconfirmed.
 - `hardware_id` in the reply topic is the device MAC, sanitized so every run of characters
   outside `[A-Za-z0-9._-]` collapses to a single `-`. Firmware and backend sanitize
   identically, so `AA:BB:CC...` → `AA-BB-CC...` on both ends.
@@ -173,6 +177,47 @@ online/offline is still derived server-side from `last_seen` + `offline_after_mi
    runtime MQTT config to NVS, switches to runtime mode, and reconnects with the approved
    credentials. From then on it boots straight into runtime mode (no re-claim) until a
    factory reset or operator-triggered re-bootstrap.
+
+## Actuator control (switches / relays)
+
+A device may expose controllable outputs (actuators) in addition to sensors. Control is
+asymmetric: the backend publishes a command, the device applies it and reports the
+resulting state back.
+
+**Command** (backend → `{topic_base}/command`, QoS 1, not retained):
+
+```json
+{
+  "type": "actuator_command",
+  "actuator_key": "relay_1",
+  "command": "on",
+  "value": null,
+  "command_id": "cmd-2f1c…",
+  "ts": "2026-06-18T09:21:04Z"
+}
+```
+
+- `command` is `on`, `off`, or `set`; `value` is required for `set` (e.g. a dimmer level).
+- `command_id` is unique per command and should be echoed back for idempotent acks.
+
+**State** (device → `{topic_base}/state`, retain recommended so late subscribers see it):
+
+```json
+{
+  "actuators": [
+    { "actuator_key": "relay_1", "state": "on" }
+  ],
+  "reported_at": "2026-06-18T09:21:05Z"
+}
+```
+
+- The backend updates each actuator's `current_state` from this report and marks the
+  outstanding command for that actuator as acknowledged.
+- The device ACL grants write on `{topic_base}/state` and read on `{topic_base}/command`.
+
+> **Deferred:** firmware does not yet subscribe to `command` or publish `state`. Until that
+> ships, the app records `desired_state` and publishes commands, but `current_state` stays
+> unconfirmed.
 
 ## Security posture (current)
 
