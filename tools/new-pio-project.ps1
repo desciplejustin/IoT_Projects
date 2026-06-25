@@ -21,13 +21,22 @@ if (Test-Path $projectPath) {
 
 New-Item -ItemType Directory -Path (Join-Path $projectPath "src") -Force | Out-Null
 
-$envName = $Board
 $ini = @"
-[env:$envName]
+[platformio]
+default_envs = app
+
+[env]
 platform = $Platform
 board = $Board
 framework = $Framework
 monitor_speed = 115200
+
+[env:app]
+extends = env
+lib_deps =
+  bblanchon/ArduinoJson @ ^7
+  256dpi/MQTT @ ^2.5.2
+  tzapu/WiFiManager @ ^2.0.17
 "@
 
 Set-Content -Path (Join-Path $projectPath "platformio.ini") -Value $ini -Encoding UTF8
@@ -38,7 +47,9 @@ $mainCpp = @"
 void setup() {
   Serial.begin(115200);
   delay(300);
+  Serial.println();
   Serial.println("$Name started");
+  Serial.println("TODO: implement MQTT telemetry baseline from FIRMWARE_BASELINE.md");
 }
 
 void loop() {
@@ -66,33 +77,43 @@ $Description
 
 Starter project scaffold created.
 
-## Protocol Baseline Requirement
+## Device-Specific Scope
 
-This project must follow `Project3-ColdRoom-TempMonitor` protocol baseline unless this file documents an approved deviation.
+- Sensor type: TODO
+- Sensor count: TODO
+- Sensor mapping: TODO
+- Board profile: $Board
+- Primary use: TODO
+- Supported control topics: TODO
+
+## MQTT Baseline Requirement
+
+This project must follow the MQTT-first firmware contract unless this file documents an approved deviation.
 
 Reference docs:
 
 - `FIRMWARE_BASELINE.md`
+- `iot_mqtt_integration_plan.md`
 - `.github/copilot-instructions.md`
 
 ## Required Contract Checklist
 
-- [ ] Telemetry endpoint path uses `/api/iot/v1/readings` (current backend port `5010`).
-- [ ] Claim flow uses `/api/iot/v1/device-claims` create + poll lifecycle.
-- [ ] Claim statuses handled: `pending`, `approved`, `expired`, `rejected`, `claim_not_found`.
-- [ ] Telemetry includes headers: `Content-Type`, `Accept`, `x-device-token`.
-- [ ] Payload includes `device_key`, unique `message_id`, and `readings[]`.
-- [ ] Sensor keys are deterministic (for probes: `probe_1`, `probe_2`) and units are canonical (`C`, `%`, `pH`, `mS/cm`).
-- [ ] Approved credentials are persisted and restored after reboot.
-- [ ] Local diagnostics UI on port `80` with auth (`/` and `/api/status`).
-- [ ] LED behavior: red blink connecting, blue success, red solid failure timeout.
-- [ ] Factory reset long-press is non-blocking and clears Wi-Fi + persisted credentials.
+- [ ] Telemetry publishes to `{topic_root}/{device_code}/telemetry`.
+- [ ] Heartbeat publishes to `{topic_root}/{device_code}/status`.
+- [ ] Retained device availability publishes to `{topic_root}/{device_code}/state`.
+- [ ] Runtime settings persist Wi-Fi and MQTT config locally.
+- [ ] Telemetry includes `schema_version`, `device_code`, unique `message_id`, and `readings[]`.
+- [ ] Sensor codes are deterministic and units are canonical (`C`, `%`, `pH`, `mS/cm`).
+- [ ] Device reconnects after Wi-Fi or broker loss.
+- [ ] Local diagnostics UI on port `80` is present for baseline telemetry nodes.
+- [ ] LED behavior matches the workspace baseline.
+- [ ] Factory reset clears Wi-Fi and stored device config.
 
 ## Verification Before Production
 
 - [ ] Captive portal onboarding works and reconnects after Wi-Fi loss.
-- [ ] Claim approval persists credentials across restart.
-- [ ] Telemetry returns success and backend reports `saved_count` updates.
+- [ ] Persisted MQTT settings survive restart.
+- [ ] Broker receives telemetry, status, and retained state updates.
 - [ ] Local dashboard shows live values and recent logs.
 "@
 
@@ -117,7 +138,7 @@ if (-not $existing) {
     board = $Board
     platform = $Platform
     framework = $Framework
-    defaultEnv = $envName
+    defaultEnv = "app"
   }
   $registry.projects += $entry
 }
@@ -126,3 +147,4 @@ $registry | ConvertTo-Json -Depth 5 | Set-Content -Path $registryPath -Encoding 
 
 Write-Host "Created project: $Name"
 Write-Host "Path: $projectPath"
+Write-Host "Reminder: add VS Code tasks for the new project in .vscode/tasks.json"

@@ -1,73 +1,92 @@
-# IoT Multi-Project Workspace
+# IoT Firmware Workspace
 
-This repository is organized for fast iteration across many devices/boards.
+This repository is the shared workspace for all firmware built under `IoT_Projects`.
+
+It is organized as a multi-project PlatformIO repo, where each device or firmware line has its own top-level folder and its own `platformio.ini`.
 
 ## Layout
 
-- `Project1/` - ESP32 + DS18B20 + IoT API test
-- `Project2/` - ESP8266 smoke test
-- `Project3-ColdRoom-TempMonitor/` - ESP32 + 2x DS18B20 cold room monitor
+- `Project1-ColdRoom-TempMonitor/` - MQTT baseline reference for a 2x DS18B20 cold-room node
+- `Project2/` - ESP8266 smoke-test sandbox
+- `Project3-MQTT-SmokeTest/` - ESP32 MQTT smoke test with one DS18B20
+- `FIRMWARE_BASELINE.md` - mandatory repo-wide firmware contract
+- `iot_mqtt_integration_plan.md` - system architecture and rollout plan
 - `projects.registry.json` - machine-readable project catalog
 - `tools/new-pio-project.ps1` - project generator
 - `.vscode/tasks.json` - one-click build/upload/monitor tasks
-- `.github/copilot-instructions.md` - repository rules for future projects
 
-Each project folder contains:
+Each project folder must contain:
 
 - `platformio.ini`
 - `src/main.cpp`
-- `PROJECT.md` (purpose, board, status, notes)
+- `PROJECT.md`
+
+## Recommended Workspace Pattern
+
+- Treat the repo root as a workspace container, not a deployable firmware app.
+- Keep one board / firmware purpose per project folder unless a project has a documented reason for multiple environments.
+- Use `Project1-ColdRoom-TempMonitor` as the MQTT-first reference implementation.
+
+## Core Baseline
+
+All new telemetry nodes should follow the repo baseline in `FIRMWARE_BASELINE.md`.
+
+Shared device rules:
+
+1. Publish telemetry and heartbeat data with MQTT.
+2. Keep local HTTP only for on-device diagnostics and setup UX.
+3. Use stable `device_code` and deterministic `sensor_code` values.
+4. Persist Wi-Fi and MQTT configuration locally.
+5. Publish device availability with retained `state` messages.
+
+## Device-Specific Scope
+
+Each project then defines its own scope in `PROJECT.md`, including:
+
+- sensor types and quantity
+- pinout and wiring notes
+- sampling / publish interval
+- payload mapping for that device
+- command / config topics it supports
+- any intentional deviation from the common baseline
+
+This gives you one shared firmware contract plus one device-specific overlay per project.
 
 ## Fast Workflow
 
 1. Open this repo in VS Code.
 2. Use `Terminal -> Run Task`.
 3. Run one of these tasks:
-   - `PIO: Build Project1`
-   - `PIO: Upload Project1`
+   - `PIO: Build Project1 App`
+   - `PIO: Upload Project1 App`
+   - `PIO: Build Project1 Scan`
+   - `PIO: Upload Project1 Scan`
    - `PIO: Monitor Project1`
    - `PIO: Build Project2`
    - `PIO: Upload Project2`
    - `PIO: Monitor Project2`
-   - `PIO: Build Project3-ColdRoom-TempMonitor`
-   - `PIO: Upload Project3-ColdRoom-TempMonitor`
-   - `PIO: Monitor Project3-ColdRoom-TempMonitor`
+   - `PIO: Build Project3`
+   - `PIO: Upload Project3`
+   - `PIO: Monitor Project3`
 
-## Create New Project (Clean-Slate Pattern)
+## Create New Project
 
 Use PowerShell from repository root:
 
 ```powershell
-.\tools\new-pio-project.ps1 -Name Project3 -Board esp32dev -Platform espressif32 -Description "ESP32 greenhouse node"
+.\tools\new-pio-project.ps1 -Name Project04-ESP32-Greenhouse -Board esp32dev -Platform espressif32 -Description "ESP32 greenhouse telemetry node"
 ```
 
-This creates a complete PlatformIO project and updates `projects.registry.json`.
+The generator creates a clean project folder and updates `projects.registry.json`.
 
-## Recommended Naming
+## Naming Guidance
 
-- Folder names: `Project01-ESP32-Greenhouse`, `Project02-ESP32-PumpNode`
-- Device key format: `ESP32-HS6-01`, `ESP32-HS6-02`
-- Sensor key format: `probe_1`, `probe_2`, `ambient_humidity`
+- Folder names: `Project04-ESP32-Greenhouse`, `Project05-ESP32-PumpNode`
+- Device codes: `greenhouse-01`, `coldroom-temp-001`
+- Sensor codes: `probe_1`, `probe_2`, `ambient_humidity`, `moisture_1`
 
-## Quick Test Checklist
+## Current Reference Split
 
-1. Register device in IoT UI and save token.
-2. Register all sensor keys and valid units (`C`, `%`, `pH`, `mS/cm`).
-3. Flash firmware.
-4. Verify API response contains `ok: true` and `saved_count`.
-5. Confirm dashboard `last_seen` and latest sensor values update.
-
-## Firmware Protocol Baseline (All New Builds)
-
-All future IoT firmware projects should follow the same working protocol used by `Project3-ColdRoom-TempMonitor`.
-
-- Primary spec: `FIRMWARE_BASELINE.md`
-- Enforced repo rules: `.github/copilot-instructions.md`
-
-High-level baseline:
-
-1. Use claim onboarding (`/api/iot/v1/device-claims`) and persist approved credentials.
-2. Send telemetry to `/api/iot/v1/readings` with `x-device-token` and unique `message_id`.
-3. Use deterministic sensor keys and canonical units.
-4. Expose local authenticated diagnostics UI (`/` and `/api/status`).
-5. Implement LED and factory-reset behavior consistent with the cold-room reference firmware.
+- `Project1-ColdRoom-TempMonitor` is the best-practice reference for future telemetry firmware in this repo.
+- `Project2` is a basic non-telemetry board test project.
+- `Project3-MQTT-SmokeTest` is a minimal MQTT publisher for quick broker-path testing.

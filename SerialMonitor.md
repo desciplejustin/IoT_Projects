@@ -1,0 +1,1 @@
+ & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" device monitor -d "d:\DEVELOPMENT\IoT_Projects\Project4-C3-TempMonitor" -b 115200

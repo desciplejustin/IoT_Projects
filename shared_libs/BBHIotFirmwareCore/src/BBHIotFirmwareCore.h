@@ -95,6 +95,13 @@ class BbhIotFirmwareCore {
   static constexpr size_t kSensorJsonMax = 1024;
   static constexpr size_t kTelemetrySlotSize = 512;
   static constexpr uint16_t kTelemetryBufferCapacity = 512;
+  static constexpr uint16_t kDefaultReadingMinutes = 5;
+  static constexpr uint16_t kMaxReadingMinutes = 1440;  // 24h ceiling
+  // Consecutive runtime MQTT auth rejections tolerated before the device
+  // assumes its credentials were revoked and falls back to bootstrap/claim.
+  // A single rejection is treated as transient (e.g. broker mid-rotation),
+  // so a credential rotation no longer instantly de-registers the device.
+  static constexpr uint8_t kMaxRuntimeAuthFailures = 5;
 
   enum DeviceMode {
     DEVICE_MODE_BOOTSTRAP,
@@ -121,12 +128,15 @@ class BbhIotFirmwareCore {
   void clearFinalConfig();
   bool hasFinalConfig() const;
   bool connectWifi();
+  void applyWifiPerformanceProfile();
   bool runOnboardingPortal(bool forcePortal);
   bool connectBootstrapMqtt();
   bool connectRuntimeMqtt();
   void performPendingMqttReconnect();
   void publishBootstrapClaim();
   bool applyApprovedConfig(JsonDocument& doc);
+  void handleRuntimeConfigMessage(const String& payload);
+  void publishConfigAck(const String& rotationId);
   void publishRuntimeStatus(const char* state);
   bool buildTelemetryRecord(String& outJson);
   bool publishTelemetryRecord(const String& json);
@@ -191,6 +201,7 @@ class BbhIotFirmwareCore {
   unsigned long lastMqttAttemptAt_;
   unsigned long lastBootstrapClaimAt_;
   uint32_t runtimeMessageCounter_;
+  uint8_t runtimeAuthFailures_;
   uint32_t bootSeq_;
   String lastPublishSummary_;
   String lastBootstrapStatus_;
@@ -226,6 +237,7 @@ class BbhIotFirmwareCore {
   uint16_t runtimeKeepaliveSeconds_;
   uint16_t expectedIntervalMinutes_;
   uint16_t offlineAfterMinutes_;
+  uint16_t readingIntervalMinutes_;  // user-configurable telemetry cadence
   StoredSensorDefinition sensorDefs_[kMaxSensors];
   size_t sensorDefCount_;
   BbhTelemetryReading latestReadings_[kMaxSensors];

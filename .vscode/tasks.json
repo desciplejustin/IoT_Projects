@@ -2,63 +2,92 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "PIO: Build Project1",
+      "label": "PIO: Monitor Project4 (C3)",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project1", "run"],
+      "args": ["device", "monitor", "-d", "Project4-C3-TempMonitor", "-b", "115200"],
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO: Upload + Monitor Project4 (C3)",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "-d", "Project4-C3-TempMonitor", "-e", "c3_app", "-t", "upload", "-t", "monitor"],
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO: Build Project1 App",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "-d", "Project1-ColdRoom-TempMonitor", "-e", "esp32dev_app"],
       "group": "build"
     },
     {
-      "label": "PIO: Upload Project1",
+      "label": "PIO: Upload Project1 App",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project1", "run", "-t", "upload"]
+      "args": ["run", "-d", "Project1-ColdRoom-TempMonitor", "-e", "esp32dev_app", "-t", "upload"]
+    },
+    {
+      "label": "PIO: Build Project1 Scan",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "-d", "Project1-ColdRoom-TempMonitor", "-e", "esp32dev_scan"],
+      "group": "build"
+    },
+    {
+      "label": "PIO: Upload Project1 Scan",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "-d", "Project1-ColdRoom-TempMonitor", "-e", "esp32dev_scan", "-t", "upload"]
     },
     {
       "label": "PIO: Monitor Project1",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project1", "device", "monitor", "-b", "115200"],
+      "args": ["device", "monitor", "-d", "Project1-ColdRoom-TempMonitor", "-b", "115200"],
       "isBackground": true
     },
     {
       "label": "PIO: Build Project2",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project2", "run"],
+      "args": ["run", "-d", "Project2"],
       "group": "build"
     },
     {
       "label": "PIO: Upload Project2",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project2", "run", "-t", "upload"]
+      "args": ["run", "-d", "Project2", "-t", "upload"]
     },
     {
       "label": "PIO: Monitor Project2",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project2", "device", "monitor", "-b", "115200"],
+      "args": ["device", "monitor", "-d", "Project2", "-b", "115200"],
       "isBackground": true
     },
     {
-      "label": "PIO: Build Project3-ColdRoom-TempMonitor",
+      "label": "PIO: Build Project3",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project3-ColdRoom-TempMonitor", "run"],
+      "args": ["run", "-d", "Project3-MQTT-SmokeTest"],
       "group": "build"
     },
     {
-      "label": "PIO: Upload Project3-ColdRoom-TempMonitor",
+      "label": "PIO: Upload Project3",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project3-ColdRoom-TempMonitor", "run", "-t", "upload"]
+      "args": ["run", "-d", "Project3-MQTT-SmokeTest", "-t", "upload"]
     },
     {
-      "label": "PIO: Monitor Project3-ColdRoom-TempMonitor",
+      "label": "PIO: Monitor Project3",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
-      "args": ["-d", "Project3-ColdRoom-TempMonitor", "device", "monitor", "-b", "115200"],
+      "args": ["device", "monitor", "-d", "Project3-MQTT-SmokeTest", "-b", "115200"],
       "isBackground": true
     }
   ]

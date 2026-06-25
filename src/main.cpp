@@ -2,15 +2,12 @@
 
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
+  delay(300);
   Serial.println();
-  Serial.println("ESP8266 NodeMCU started");
+  Serial.println("IoT_Projects workspace root");
+  Serial.println("Build from an individual project folder instead of the repository root.");
 }
 
 void loop() {
-  digitalWrite(LED_BUILTIN, LOW);  // LED on (active low)
-  delay(500);
-  digitalWrite(LED_BUILTIN, HIGH); // LED off
-  delay(500);
-  Serial.println("blink");
+  delay(1000);
 }

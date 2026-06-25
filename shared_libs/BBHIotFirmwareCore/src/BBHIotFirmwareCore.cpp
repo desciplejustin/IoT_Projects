@@ -3,6 +3,14 @@
 #include <LittleFS.h>
 #include <time.h>
 
+// Opt-in WiFi performance profile. When enabled, the radio runs at maximum TX
+// power with modem sleep disabled: stronger uplink and steadier connectivity at
+// the cost of higher idle current. Off by default; enable per project for
+// mains-powered devices with -D BBH_WIFI_HIGH_PERFORMANCE=1 in platformio.ini.
+#ifndef BBH_WIFI_HIGH_PERFORMANCE
+#define BBH_WIFI_HIGH_PERFORMANCE 0
+#endif
+
 namespace {
 constexpr const char* kTelemetryBufferPath = "/tbuf.bin";
 constexpr time_t kMinValidEpoch = 1700000000;  // ~2023-11, sanity floor for NTP sync
@@ -111,6 +119,7 @@ BbhIotFirmwareCore::BbhIotFirmwareCore(
       lastMqttAttemptAt_(0),
       lastBootstrapClaimAt_(0),
       runtimeMessageCounter_(0),
+      runtimeAuthFailures_(0),
       bootSeq_(0),
       lastPublishSummary_("none"),
       lastBootstrapStatus_("waiting"),
@@ -124,6 +133,7 @@ BbhIotFirmwareCore::BbhIotFirmwareCore(
       runtimeKeepaliveSeconds_(60),
       expectedIntervalMinutes_(0),
       offlineAfterMinutes_(0),
+      readingIntervalMinutes_(kDefaultReadingMinutes),
       sensorDefCount_(0),
       latestReadingCount_(0),
       fsReady_(false),
@@ -219,7 +229,8 @@ void BbhIotFirmwareCore::loop() {
     lastStatusAt_ = millis();
   }
 
-  if (millis() - lastTelemetryAt_ >= config_.timing.telemetryIntervalMs) {
+  const unsigned long readingIntervalMs = static_cast<unsigned long>(readingIntervalMinutes_) * 60000UL;
+  if (millis() - lastTelemetryAt_ >= readingIntervalMs) {
     String record;
     if (buildTelemetryRecord(record)) {
       // Send live only when online AND the backlog is already empty, so buffered
@@ -280,6 +291,7 @@ void BbhIotFirmwareCore::persistBootstrapConfig() {
   configStore_.putString("bs_claim", String(bootstrapClaimTopic_));
   configStore_.putString("bs_reply", String(bootstrapReplyPrefix_));
   configStore_.putString("loc_hint", String(locationHint_));
+  configStore_.putUShort("bs_interval", readingIntervalMinutes_);
   configStore_.end();
 }
 
@@ -396,6 +408,14 @@ void BbhIotFirmwareCore::loadRuntimeConfig() {
   snprintf(bootstrapReplyPrefix_, sizeof(bootstrapReplyPrefix_), "%s", storedReply.c_str());
   snprintf(locationHint_, sizeof(locationHint_), "%s", storedHint.c_str());
 
+  readingIntervalMinutes_ = configStore_.getUShort("bs_interval", kDefaultReadingMinutes);
+  if (readingIntervalMinutes_ < 1) {
+    readingIntervalMinutes_ = kDefaultReadingMinutes;
+  }
+  if (readingIntervalMinutes_ > kMaxReadingMinutes) {
+    readingIntervalMinutes_ = kMaxReadingMinutes;
+  }
+
   snprintf(deviceKey_, sizeof(deviceKey_), "%s", configStore_.getString("dev_key", "").c_str());
   snprintf(deviceName_, sizeof(deviceName_), "%s", configStore_.getString("dev_name", "").c_str());
   snprintf(deviceType_, sizeof(deviceType_), "%s", configStore_.getString("dev_type", "").c_str());
@@ -463,6 +483,19 @@ bool BbhIotFirmwareCore::hasFinalConfig() const {
          !isBlank(runtimePassword_) && runtimeBrokerPort_ > 0;
 }
 
+static const char* wifiStatusReason(wl_status_t status) {
+  switch (status) {
+    case WL_CONNECTED:       return "connected";
+    case WL_NO_SSID_AVAIL:   return "network not found (wrong SSID, out of range, or 5GHz-only)";
+    case WL_CONNECT_FAILED:  return "auth failed (wrong password?)";
+    case WL_CONNECTION_LOST: return "connection lost (signal dropped)";
+    case WL_DISCONNECTED:    return "disconnected / still negotiating";
+    case WL_IDLE_STATUS:     return "idle";
+    case WL_NO_SHIELD:       return "no wifi radio";
+    default:                 return "unknown";
+  }
+}
+
 bool BbhIotFirmwareCore::connectWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     ensureLocalServer();
@@ -471,6 +504,7 @@ bool BbhIotFirmwareCore::connectWifi() {
 
   WiFi.mode(WIFI_STA);
   WiFi.begin();
+  applyWifiPerformanceProfile();
 
   Serial.print("WiFi connecting");
   unsigned long startMs = millis();
@@ -493,42 +527,88 @@ bool BbhIotFirmwareCore::connectWifi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     ensureLocalServer();
-    logEvent("WiFi connected, IP: " + WiFi.localIP().toString());
+    logEvent("WiFi connected, IP: " + WiFi.localIP().toString() + ", RSSI: " + String(WiFi.RSSI()) + " dBm");
     return true;
   }
 
   setBlueLed(false);
   setRedLed(true);
-  logEvent("WiFi connection failed (timeout). Starting setup AP...");
+  logEvent(String("WiFi connection failed: ") + wifiStatusReason(WiFi.status()) + ". Starting setup AP...");
   return runOnboardingPortal(false);
+}
+
+void BbhIotFirmwareCore::applyWifiPerformanceProfile() {
+#if BBH_WIFI_HIGH_PERFORMANCE
+  // Keep the radio fully awake (no modem micro-naps) for stabler RSSI and faster
+  // reconnects, and transmit at maximum power for better range. Higher idle
+  // current, so this is opt-in for devices where power is not a concern.
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    logEvent("WiFi high-performance profile enabled (max TX power, modem sleep off).");
+  }
+#endif
 }
 
 bool BbhIotFirmwareCore::runOnboardingPortal(bool forcePortal) {
   WiFiManager wm;
+  // Verbose portal + connection logging to Serial. The browser can't show live
+  // STA-connect progress (the page is served from the AP while the radio tests
+  // the new network), so the serial monitor is the real progress window.
+  wm.setDebugOutput(true);
   wm.setConfigPortalTimeout(180);
   wm.setConnectTimeout(max(1UL, config_.timing.wifiConnectTimeoutMs / 1000UL));
   wm.setConnectRetries(1);
 
-  char portBuffer[8];
-  snprintf(portBuffer, sizeof(portBuffer), "%u", bootstrapBrokerPort_);
+#if BBH_WIFI_HIGH_PERFORMANCE
+  // The captive setup AP is hosted right next to whoever is onboarding, so it
+  // never needs range. The high-power station profile is for reaching a distant
+  // router; leaving it on for our own SoftAP only spikes peak current (brown-outs
+  // that make the AP drop in and out) and heats the board on USB power. Drop TX
+  // power once the portal AP comes up — applyWifiPerformanceProfile() below
+  // restores the full station profile after we join the real network.
+  wm.setAPCallback([](WiFiManager*) {
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  });
+#endif
 
-  WiFiManagerParameter brokerHostParam("bs_host", "Bootstrap broker host", bootstrapBrokerHost_, sizeof(bootstrapBrokerHost_) - 1);
-  WiFiManagerParameter brokerPortParam("bs_port", "Bootstrap broker port", portBuffer, sizeof(portBuffer) - 1);
-  WiFiManagerParameter bootstrapUserParam("bs_user", "Bootstrap MQTT user", bootstrapUsername_, sizeof(bootstrapUsername_) - 1);
-  WiFiManagerParameter bootstrapPassParam("bs_pass", "Bootstrap MQTT pass", bootstrapPassword_, sizeof(bootstrapPassword_) - 1);
-  WiFiManagerParameter bootstrapClientIdParam(
-      "bs_client", "Bootstrap MQTT client id", bootstrapClientId_, sizeof(bootstrapClientId_) - 1);
-  WiFiManagerParameter claimTopicParam("bs_claim", "Bootstrap claim topic", bootstrapClaimTopic_, sizeof(bootstrapClaimTopic_) - 1);
-  WiFiManagerParameter replyPrefixParam("bs_reply", "Bootstrap reply prefix", bootstrapReplyPrefix_, sizeof(bootstrapReplyPrefix_) - 1);
-  WiFiManagerParameter locationHintParam("loc_hint", "Location hint", locationHint_, sizeof(locationHint_) - 1);
+  // Modern look & feel for the captive setup portal. Injected into <head> so it
+  // overrides WiFiManager's built-in styling.
+  static const char kPortalCss[] PROGMEM =
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<style>"
+      ":root{--bbh:#0f62fe;}"
+      "body{background:#eef2f7;font-family:'Segoe UI',Roboto,Arial,sans-serif;color:#1e2a38;}"
+      ".wrap{max-width:440px;margin:0 auto;padding:10px 16px 28px;}"
+      "h1{color:var(--bbh);text-align:center;font-weight:700;letter-spacing:.4px;margin:18px 0 4px;}"
+      "h3{text-align:center;color:#5b6b7e;font-weight:500;margin:0 0 14px;}"
+      "button,input,select{border-radius:10px;font-size:15px;}"
+      "button{background:var(--bbh);border:0;color:#fff;font-weight:600;padding:12px;box-shadow:0 2px 6px rgba(15,98,254,.25);}"
+      "button:hover{filter:brightness(1.07);}"
+      "input,select{border:1px solid #cdd7e3;padding:11px;background:#fff;width:100%;}"
+      "input:focus,select:focus{outline:none;border-color:var(--bbh);box-shadow:0 0 0 3px rgba(15,98,254,.15);}"
+      "a{color:var(--bbh);}"
+      ".msg{border-left:4px solid var(--bbh);background:#fff;border-radius:8px;padding:10px 12px;}"
+      "</style>";
+  wm.setCustomHeadElement(kPortalCss);
+
+  // Simplified onboarding: only the essentials are user-facing. Broker port,
+  // MQTT username, client id, claim topic and reply prefix keep their
+  // compiled-in defaults (see BbhBootstrapDefaults) and can still be changed
+  // later from the device's local web page if ever needed.
+  char intervalBuffer[8];
+  snprintf(intervalBuffer, sizeof(intervalBuffer), "%u", readingIntervalMinutes_);
+
+  WiFiManagerParameter brokerHostParam("bs_host", "MQTT broker IP", bootstrapBrokerHost_, sizeof(bootstrapBrokerHost_) - 1);
+  WiFiManagerParameter bootstrapPassParam("bs_pass", "MQTT password (blank = keep default)", "", sizeof(bootstrapPassword_) - 1);
+  WiFiManagerParameter readingIntervalParam("bs_interval", "Reading interval (minutes)", intervalBuffer, sizeof(intervalBuffer) - 1);
+  WiFiManagerParameter locationHintParam("loc_hint", "Location (optional)", locationHint_, sizeof(locationHint_) - 1);
 
   wm.addParameter(&brokerHostParam);
-  wm.addParameter(&brokerPortParam);
-  wm.addParameter(&bootstrapUserParam);
   wm.addParameter(&bootstrapPassParam);
-  wm.addParameter(&bootstrapClientIdParam);
-  wm.addParameter(&claimTopicParam);
-  wm.addParameter(&replyPrefixParam);
+  wm.addParameter(&readingIntervalParam);
   wm.addParameter(&locationHintParam);
 
   bool configured =
@@ -538,19 +618,26 @@ bool BbhIotFirmwareCore::runOnboardingPortal(bool forcePortal) {
   if (!configured) {
     setBlueLed(false);
     setRedLed(true);
-    logEvent("Onboarding AP timed out or failed.");
+    logEvent(String("Onboarding AP timed out or failed: ") + wifiStatusReason(WiFi.status()));
     return false;
   }
 
+  applyWifiPerformanceProfile();
+
   copyTrimmed(bootstrapBrokerHost_, sizeof(bootstrapBrokerHost_), brokerHostParam.getValue());
-  bootstrapBrokerPort_ = static_cast<uint16_t>(strtoul(brokerPortParam.getValue(), nullptr, 10));
-  copyTrimmed(bootstrapUsername_, sizeof(bootstrapUsername_), bootstrapUserParam.getValue());
-  copyTrimmed(bootstrapPassword_, sizeof(bootstrapPassword_), bootstrapPassParam.getValue());
-  copyTrimmed(bootstrapClientId_, sizeof(bootstrapClientId_), bootstrapClientIdParam.getValue());
-  copyTrimmed(bootstrapClaimTopic_, sizeof(bootstrapClaimTopic_), claimTopicParam.getValue());
-  copyTrimmed(bootstrapReplyPrefix_, sizeof(bootstrapReplyPrefix_), replyPrefixParam.getValue());
+  if (!isBlank(bootstrapPassParam.getValue())) {
+    copyTrimmed(bootstrapPassword_, sizeof(bootstrapPassword_), bootstrapPassParam.getValue());
+  }
   copyTrimmed(locationHint_, sizeof(locationHint_), locationHintParam.getValue());
 
+  unsigned long mins = strtoul(readingIntervalParam.getValue(), nullptr, 10);
+  if (mins >= 1 && mins <= kMaxReadingMinutes) {
+    readingIntervalMinutes_ = static_cast<uint16_t>(mins);
+  }
+
+  if (isBlank(bootstrapBrokerHost_)) {
+    copyTrimmed(bootstrapBrokerHost_, sizeof(bootstrapBrokerHost_), config_.bootstrap.brokerHost);
+  }
   if (bootstrapBrokerPort_ == 0) {
     bootstrapBrokerPort_ = config_.bootstrap.brokerPort;
   }
@@ -560,7 +647,7 @@ bool BbhIotFirmwareCore::runOnboardingPortal(bool forcePortal) {
 
   setBlueLed(true);
   setRedLed(false);
-  logEvent("WiFi connected after onboarding, IP: " + WiFi.localIP().toString());
+  logEvent("WiFi connected after onboarding, IP: " + WiFi.localIP().toString() + ", RSSI: " + String(WiFi.RSSI()) + " dBm");
   return true;
 }
 
@@ -639,13 +726,35 @@ bool BbhIotFirmwareCore::connectRuntimeMqtt() {
     setRedLed(true);
     logEvent("Runtime MQTT connect failed: " + mqttFailureSummary(mqtt_));
     if (isRuntimeAuthDenied(mqtt_)) {
-      logEvent("Runtime MQTT auth denied. Clearing stored runtime config and returning to bootstrap.");
-      clearFinalConfig();
-      deviceMode_ = DEVICE_MODE_BOOTSTRAP;
-      lastMqttAttemptAt_ = 0;
-      requestMqttReconnect("runtime auth denied; switching back to bootstrap MQTT");
+      runtimeAuthFailures_++;
+      if (runtimeAuthFailures_ < kMaxRuntimeAuthFailures) {
+        // Treat the first few rejections as transient (e.g. broker mid-rotation
+        // or a momentary ACL desync) and keep retrying with the stored creds,
+        // rather than wiping the device back to bootstrap on a single failure.
+        logEvent("Runtime MQTT auth denied (" + String(runtimeAuthFailures_) + "/" +
+                 String(kMaxRuntimeAuthFailures) + "). Retrying with stored credentials.");
+      } else {
+        logEvent("Runtime MQTT auth denied repeatedly. Clearing stored runtime config and returning to bootstrap.");
+        runtimeAuthFailures_ = 0;
+        clearFinalConfig();
+        deviceMode_ = DEVICE_MODE_BOOTSTRAP;
+        lastMqttAttemptAt_ = 0;
+        requestMqttReconnect("runtime auth denied repeatedly; switching back to bootstrap MQTT");
+      }
     }
     return false;
+  }
+
+  runtimeAuthFailures_ = 0;
+
+  // Subscribe to the per-device config topic so the backend can push new
+  // credentials to a live device (graceful rotation) without forcing a full
+  // re-onboard. The device applies them, ACKs on its state topic, then reconnects.
+  String runtimeConfigTopic = String(runtimeTopicBase_) + "/config";
+  if (mqtt_.subscribe(runtimeConfigTopic, runtimeQos_)) {
+    logEvent("Runtime config subscribe ok " + runtimeConfigTopic);
+  } else {
+    logEvent("Runtime config subscribe FAILED " + runtimeConfigTopic);
   }
 
   publishRuntimeStatus("online");
@@ -1038,6 +1147,13 @@ String BbhIotFirmwareCore::currentIso8601() {
 }
 
 void BbhIotFirmwareCore::onMqttMessage(String& topic, String& payload) {
+  if (deviceMode_ == DEVICE_MODE_RUNTIME) {
+    if (topic == String(runtimeTopicBase_) + "/config") {
+      handleRuntimeConfigMessage(payload);
+    }
+    return;
+  }
+
   if (deviceMode_ != DEVICE_MODE_BOOTSTRAP || topic != bootstrapReplyTopic()) {
     return;
   }
@@ -1089,6 +1205,65 @@ void BbhIotFirmwareCore::onMqttMessage(String& topic, String& payload) {
   logEvent("Bootstrap approved. Final MQTT config stored.");
   deviceMode_ = DEVICE_MODE_RUNTIME;
   requestMqttReconnect("switching from bootstrap MQTT to runtime MQTT");
+}
+
+void BbhIotFirmwareCore::handleRuntimeConfigMessage(const String& payload) {
+  logEvent("Runtime config RX (credential push).");
+  JsonDocument doc;
+  if (deserializeJson(doc, payload) != DeserializationError::Ok) {
+    logEvent("Runtime config parse failed.");
+    return;
+  }
+
+  const char* msgHardwareId = doc["hardware_id"] | "";
+  if (strlen(msgHardwareId) > 0 && String(msgHardwareId) != hardwareId()) {
+    logEvent("Runtime config ignored: hardware_id mismatch.");
+    return;
+  }
+
+  String kind = String((const char*)(doc["kind"] | ""));
+  if (kind != "device_config") {
+    logEvent("Runtime config ignored: kind is not device_config.");
+    return;
+  }
+
+  // Correlate the ACK with the backend's rotation request, if one was supplied.
+  String rotationId = String((const char*)(doc["rotation_id"] | ""));
+
+  if (!applyApprovedConfig(doc)) {
+    logEvent("Runtime config failed validation; keeping previous credentials.");
+    return;
+  }
+
+  // ACK on the live (still-authenticated) session BEFORE reconnecting, so the
+  // backend swaps the broker password only after the device has persisted the
+  // new credentials. The reconnect then comes up on the new credentials; the
+  // auth-retry tolerance covers the brief window while the broker catches up.
+  runtimeAuthFailures_ = 0;
+  publishConfigAck(rotationId);
+  logEvent("Runtime credentials updated via config push.");
+  requestMqttReconnect("runtime credentials updated via config push");
+}
+
+void BbhIotFirmwareCore::publishConfigAck(const String& rotationId) {
+  if (!mqtt_.connected() || isBlank(runtimeTopicBase_)) {
+    return;
+  }
+
+  JsonDocument doc;
+  doc["event"] = "config_applied";
+  doc["device_key"] = deviceKey_;
+  if (rotationId.length() > 0) {
+    doc["rotation_id"] = rotationId;
+  }
+  doc["firmware_version"] = config_.firmwareVersion;
+
+  String payload;
+  serializeJson(doc, payload);
+  String stateTopic = String(runtimeTopicBase_) + "/state";
+  bool ok = mqtt_.publish(stateTopic, payload, false, runtimeQos_);
+  mqtt_.loop();  // nudge the client to flush the ACK before the pending reconnect.
+  logEvent(String("Config ACK ") + (ok ? "sent" : "failed") + " on " + stateTopic);
 }
 
 void BbhIotFirmwareCore::ensureLocalServer() {
@@ -1186,13 +1361,13 @@ void BbhIotFirmwareCore::handleLocalStatusPage() {
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>BBH IoT Device</title>";
-  html += "<style>*{box-sizing:border-box;}body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f6f8fb;color:#1e2a38;}";
-  html += ".wrap{max-width:1040px;margin:0 auto;padding:14px;}.grid{display:grid;gap:10px;grid-template-columns:1fr;}";
-  html += ".panel{background:#fff;border:1px solid #d8e0ea;border-radius:8px;padding:12px;}table{border-collapse:collapse;width:100%;font-size:13px;}";
-  html += "td,th{padding:7px 4px;border-bottom:1px solid #eef2f6;text-align:left;vertical-align:top;}td:first-child{width:40%;color:#506173;font-weight:600;}";
-  html += "h1,h2{margin:0 0 10px 0;}h1{font-size:21px;}h2{font-size:16px;}p{margin:0 0 10px 0;color:#506173;font-size:13px;}";
-  html += "label{display:block;font-size:12px;font-weight:600;color:#506173;margin:10px 0 4px;}input{width:100%;padding:10px;border:1px solid #cfd8e3;border-radius:6px;font-size:14px;}";
-  html += ".actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;}.btn{display:inline-block;padding:10px 14px;border-radius:6px;border:0;background:#0f62fe;color:#fff;font-weight:600;cursor:pointer;text-decoration:none;}";
+  html += "<style>*{box-sizing:border-box;}body{font-family:'Segoe UI',Roboto,Arial,sans-serif;margin:0;background:#eef2f7;color:#1e2a38;}";
+  html += ".wrap{max-width:1040px;margin:0 auto;padding:18px 16px 28px;}.grid{display:grid;gap:14px;grid-template-columns:1fr;}";
+  html += ".panel{background:#fff;border:1px solid #e3e9f1;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(16,40,80,.06),0 4px 12px rgba(16,40,80,.04);}table{border-collapse:collapse;width:100%;font-size:13px;}";
+  html += "td,th{padding:8px 4px;border-bottom:1px solid #eef2f6;text-align:left;vertical-align:top;}td:first-child{width:40%;color:#506173;font-weight:600;}";
+  html += "h1,h2{margin:0 0 12px 0;}h1{font-size:22px;color:#0f62fe;letter-spacing:.3px;}h2{font-size:16px;}p{margin:0 0 10px 0;color:#506173;font-size:13px;}";
+  html += "label{display:block;font-size:12px;font-weight:600;color:#506173;margin:10px 0 4px;}input{width:100%;padding:11px;border:1px solid #cfd8e3;border-radius:10px;font-size:14px;}input:focus{outline:none;border-color:#0f62fe;box-shadow:0 0 0 3px rgba(15,98,254,.15);}";
+  html += ".actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;}.btn{display:inline-block;padding:10px 16px;border-radius:10px;border:0;background:#0f62fe;color:#fff;font-weight:600;cursor:pointer;text-decoration:none;box-shadow:0 2px 6px rgba(15,98,254,.25);}";
   html += ".btn.secondary{background:#e9eef5;color:#1e2a38;}.btn.warn{background:#9f1239;color:#fff;}.notice{padding:10px 12px;border-radius:6px;margin-bottom:10px;font-size:13px;}";
   html += ".notice.ok{background:#e8f7ec;color:#185c37;border:1px solid #b8e0c2;}.notice.info{background:#eef4ff;color:#24417a;border:1px solid #c6d6fb;}";
   html += ".pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700;}.pill.ok{background:#dff7e8;color:#166534;}.pill.bad{background:#fee2e2;color:#991b1b;}.pill.wait{background:#fef3c7;color:#92400e;}";
@@ -1250,24 +1425,16 @@ void BbhIotFirmwareCore::handleLocalStatusPage() {
   }
   html += "</table></div>";
 
-  html += "<details class='wide' " + String(runtimeMode ? "" : "open") + "><summary>Bootstrap Setup</summary>";
-  html += "<p>Update recovery/bootstrap settings. Passwords are never shown after saving.</p>";
+  html += "<details class='wide' " + String(runtimeMode ? "" : "open") + "><summary>MQTT Setup</summary>";
+  html += "<p>Point the device at the MQTT broker. Only the broker IP is required; the password is optional and never shown after saving.</p>";
   html += "<form method='post' action='/setup'>";
-  html += "<label for='bs_host'>Bootstrap broker host</label>";
+  html += "<label for='bs_host'>MQTT broker IP</label>";
   html += "<input id='bs_host' name='bs_host' value='" + htmlEscape(String(bootstrapBrokerHost_)) + "' maxlength='79' required>";
-  html += "<label for='bs_port'>Bootstrap broker port</label>";
-  html += "<input id='bs_port' name='bs_port' type='number' min='1' max='65535' value='" + String(bootstrapBrokerPort_) + "' required>";
-  html += "<label for='bs_user'>Bootstrap MQTT username</label>";
-  html += "<input id='bs_user' name='bs_user' value='" + htmlEscape(String(bootstrapUsername_)) + "' maxlength='63'>";
-  html += "<label for='bs_pass'>Bootstrap MQTT password</label>";
+  html += "<label for='bs_pass'>MQTT password</label>";
   html += "<input id='bs_pass' name='bs_pass' type='password' value='' maxlength='79' placeholder='Leave blank to keep saved password'>";
-  html += "<label for='bs_client'>Bootstrap MQTT client ID</label>";
-  html += "<input id='bs_client' name='bs_client' value='" + htmlEscape(String(bootstrapClientId_)) + "' maxlength='79'>";
-  html += "<label for='bs_claim'>Bootstrap claim topic</label>";
-  html += "<input id='bs_claim' name='bs_claim' value='" + htmlEscape(String(bootstrapClaimTopic_)) + "' maxlength='119' required>";
-  html += "<label for='bs_reply'>Bootstrap reply prefix</label>";
-  html += "<input id='bs_reply' name='bs_reply' value='" + htmlEscape(String(bootstrapReplyPrefix_)) + "' maxlength='119' required>";
-  html += "<label for='loc_hint'>Location hint</label>";
+  html += "<label for='bs_interval'>Reading interval (minutes)</label>";
+  html += "<input id='bs_interval' name='bs_interval' type='number' min='1' max='1440' value='" + String(readingIntervalMinutes_) + "' required>";
+  html += "<label for='loc_hint'>Location (optional)</label>";
   html += "<input id='loc_hint' name='loc_hint' value='" + htmlEscape(String(locationHint_)) + "' maxlength='63'>";
   html += "<div class='actions'><button class='btn' type='submit'>Save Bootstrap Settings</button></div>";
   html += "</form></details>";
@@ -1352,24 +1519,33 @@ void BbhIotFirmwareCore::handleLocalSetupSave() {
   }
 
   copyTrimmed(bootstrapBrokerHost_, sizeof(bootstrapBrokerHost_), localServer_.arg("bs_host").c_str());
-  copyTrimmed(bootstrapUsername_, sizeof(bootstrapUsername_), localServer_.arg("bs_user").c_str());
   String submittedBootstrapPassword = localServer_.arg("bs_pass");
   submittedBootstrapPassword.trim();
   if (submittedBootstrapPassword.length() > 0) {
     copyTrimmed(bootstrapPassword_, sizeof(bootstrapPassword_), submittedBootstrapPassword.c_str());
   }
-  copyTrimmed(bootstrapClientId_, sizeof(bootstrapClientId_), localServer_.arg("bs_client").c_str());
-  copyTrimmed(bootstrapClaimTopic_, sizeof(bootstrapClaimTopic_), localServer_.arg("bs_claim").c_str());
-  copyTrimmed(bootstrapReplyPrefix_, sizeof(bootstrapReplyPrefix_), localServer_.arg("bs_reply").c_str());
   copyTrimmed(locationHint_, sizeof(locationHint_), localServer_.arg("loc_hint").c_str());
 
-  bootstrapBrokerPort_ = static_cast<uint16_t>(strtoul(localServer_.arg("bs_port").c_str(), nullptr, 10));
+  String intervalArg = localServer_.arg("bs_interval");
+  intervalArg.trim();
+  if (intervalArg.length() > 0) {
+    unsigned long mins = strtoul(intervalArg.c_str(), nullptr, 10);
+    if (mins >= 1 && mins <= kMaxReadingMinutes) {
+      readingIntervalMinutes_ = static_cast<uint16_t>(mins);
+    }
+  }
 
+  // Broker port, MQTT username, client id, claim topic and reply prefix are no
+  // longer user-facing; they keep their saved values, falling back to the
+  // compiled-in defaults if anything is somehow blank.
   if (isBlank(bootstrapBrokerHost_)) {
     copyTrimmed(bootstrapBrokerHost_, sizeof(bootstrapBrokerHost_), config_.bootstrap.brokerHost);
   }
   if (bootstrapBrokerPort_ == 0) {
     bootstrapBrokerPort_ = config_.bootstrap.brokerPort;
+  }
+  if (isBlank(bootstrapUsername_)) {
+    copyTrimmed(bootstrapUsername_, sizeof(bootstrapUsername_), config_.bootstrap.username);
   }
   if (isBlank(bootstrapClientId_)) {
     copyTrimmed(bootstrapClientId_, sizeof(bootstrapClientId_), config_.bootstrap.clientId);
