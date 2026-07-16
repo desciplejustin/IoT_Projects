@@ -238,7 +238,7 @@ class BbhIotFirmwareCore {
   uint16_t expectedIntervalMinutes_;
   uint16_t offlineAfterMinutes_;
   uint16_t readingIntervalMinutes_;  // user-configurable telemetry cadence
-  uint8_t wifiTxPower_;  // WiFi TX power in dBm (20-82, default 78)
+  uint8_t wifiTxPower_;  // WiFi TX power in dBm (5-20, default 20 = max)
   StoredSensorDefinition sensorDefs_[kMaxSensors];
   size_t sensorDefCount_;
   BbhTelemetryReading latestReadings_[kMaxSensors];

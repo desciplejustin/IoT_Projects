@@ -417,9 +417,11 @@ void BbhIotFirmwareCore::loadRuntimeConfig() {
     readingIntervalMinutes_ = kMaxReadingMinutes;
   }
 
-  wifiTxPower_ = configStore_.getUChar("wifi_tx_pwr", 78);
-  if (wifiTxPower_ < 20 || wifiTxPower_ > 82) {
-    wifiTxPower_ = 78;
+  // Stored as whole dBm (5-20). Default 20 dBm = chip max, preserving the old
+  // hardcoded high-power behavior; drag lower to save current on close devices.
+  wifiTxPower_ = configStore_.getUChar("wifi_tx_pwr", 20);
+  if (wifiTxPower_ < 5 || wifiTxPower_ > 20) {
+    wifiTxPower_ = 20;
   }
 
   snprintf(deviceKey_, sizeof(deviceKey_), "%s", configStore_.getString("dev_key", "").c_str());
@@ -544,7 +546,10 @@ bool BbhIotFirmwareCore::connectWifi() {
 }
 
 void BbhIotFirmwareCore::applyWifiPerformanceProfile() {
-  WiFi.setTxPower((wifi_power_t)(wifiTxPower_ / 2));
+  // wifi_power_t is in 0.25 dBm units, so multiply whole-dBm by 4 (e.g. 20 dBm
+  // -> 80 -> WIFI_POWER max bracket). esp_wifi_set_max_tx_power clamps to the
+  // nearest supported step.
+  WiFi.setTxPower((wifi_power_t)(wifiTxPower_ * 4));
 #if BBH_WIFI_HIGH_PERFORMANCE
   // Keep the radio fully awake (no modem micro-naps) for stabler RSSI and faster
   // reconnects, and transmit at maximum power for better range. Higher idle
@@ -1453,7 +1458,7 @@ void BbhIotFirmwareCore::handleLocalStatusPage() {
   html += "<label for='bs_interval'>Reading interval (minutes)</label>";
   html += "<input id='bs_interval' name='bs_interval' type='number' min='1' max='1440' value='" + String(readingIntervalMinutes_) + "' required>";
   html += "<div class='slider-label'><label for='wifi_tx_pwr'>WiFi transmit power</label><span class='slider-val' id='wifi_tx_pwr_val'>" + String(wifiTxPower_) + " dBm</span></div>";
-  html += "<input id='wifi_tx_pwr' name='wifi_tx_pwr' type='range' min='20' max='82' value='" + String(wifiTxPower_) + "' onchange=\"updateSliderVal('wifi_tx_pwr')\" oninput=\"updateSliderVal('wifi_tx_pwr')\">";
+  html += "<input id='wifi_tx_pwr' name='wifi_tx_pwr' type='range' min='5' max='20' value='" + String(wifiTxPower_) + "' onchange=\"updateSliderVal('wifi_tx_pwr',this.value)\" oninput=\"updateSliderVal('wifi_tx_pwr',this.value)\">";
   html += "<label for='loc_hint'>Location (optional)</label>";
   html += "<input id='loc_hint' name='loc_hint' value='" + htmlEscape(String(locationHint_)) + "' maxlength='63'>";
   html += "<div class='actions'><button class='btn' type='submit'>Save Bootstrap Settings</button></div>";
@@ -1559,7 +1564,7 @@ void BbhIotFirmwareCore::handleLocalSetupSave() {
   wifiTxPwrArg.trim();
   if (wifiTxPwrArg.length() > 0) {
     unsigned long pwr = strtoul(wifiTxPwrArg.c_str(), nullptr, 10);
-    if (pwr >= 20 && pwr <= 82) {
+    if (pwr >= 5 && pwr <= 20) {
       wifiTxPower_ = static_cast<uint8_t>(pwr);
     }
   }
@@ -1587,7 +1592,10 @@ void BbhIotFirmwareCore::handleLocalSetupSave() {
   }
 
   persistBootstrapConfig();
-  logEvent("Bootstrap settings updated from local portal.");
+  // Apply the (possibly changed) TX power live so it takes effect without a
+  // reboot; it also re-applies on every WiFi connect.
+  applyWifiPerformanceProfile();
+  logEvent("Bootstrap settings updated from local portal. WiFi TX power: " + String(wifiTxPower_) + " dBm");
   if (deviceMode_ == DEVICE_MODE_BOOTSTRAP) {
     requestMqttReconnect("bootstrap settings updated from local portal");
   }
