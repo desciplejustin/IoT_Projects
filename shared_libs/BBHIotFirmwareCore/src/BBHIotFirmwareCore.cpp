@@ -292,6 +292,7 @@ void BbhIotFirmwareCore::persistBootstrapConfig() {
   configStore_.putString("bs_reply", String(bootstrapReplyPrefix_));
   configStore_.putString("loc_hint", String(locationHint_));
   configStore_.putUShort("bs_interval", readingIntervalMinutes_);
+  configStore_.putUChar("wifi_tx_pwr", wifiTxPower_);
   configStore_.end();
 }
 
@@ -416,6 +417,11 @@ void BbhIotFirmwareCore::loadRuntimeConfig() {
     readingIntervalMinutes_ = kMaxReadingMinutes;
   }
 
+  wifiTxPower_ = configStore_.getUChar("wifi_tx_pwr", 78);
+  if (wifiTxPower_ < 20 || wifiTxPower_ > 82) {
+    wifiTxPower_ = 78;
+  }
+
   snprintf(deviceKey_, sizeof(deviceKey_), "%s", configStore_.getString("dev_key", "").c_str());
   snprintf(deviceName_, sizeof(deviceName_), "%s", configStore_.getString("dev_name", "").c_str());
   snprintf(deviceType_, sizeof(deviceType_), "%s", configStore_.getString("dev_type", "").c_str());
@@ -538,16 +544,16 @@ bool BbhIotFirmwareCore::connectWifi() {
 }
 
 void BbhIotFirmwareCore::applyWifiPerformanceProfile() {
+  WiFi.setTxPower(wifiTxPower_ / 2.0f);
 #if BBH_WIFI_HIGH_PERFORMANCE
   // Keep the radio fully awake (no modem micro-naps) for stabler RSSI and faster
   // reconnects, and transmit at maximum power for better range. Higher idle
   // current, so this is opt-in for devices where power is not a concern.
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   static bool logged = false;
   if (!logged) {
     logged = true;
-    logEvent("WiFi high-performance profile enabled (max TX power, modem sleep off).");
+    logEvent("WiFi high-performance profile enabled (modem sleep off).");
   }
 #endif
 }
@@ -1304,6 +1310,15 @@ void BbhIotFirmwareCore::clearProvisioningAndRestart() {
   WiFiManager wm;
   wm.resetSettings();
 
+  setBlueLed(false);
+  setRedLed(false);
+  for (int i = 0; i < 3; i++) {
+    setRedLed(true);
+    delay(250);
+    setRedLed(false);
+    delay(250);
+  }
+
   delay(300);
   ESP.restart();
 }
@@ -1367,12 +1382,15 @@ void BbhIotFirmwareCore::handleLocalStatusPage() {
   html += "td,th{padding:8px 4px;border-bottom:1px solid #eef2f6;text-align:left;vertical-align:top;}td:first-child{width:40%;color:#506173;font-weight:600;}";
   html += "h1,h2{margin:0 0 12px 0;}h1{font-size:22px;color:#0f62fe;letter-spacing:.3px;}h2{font-size:16px;}p{margin:0 0 10px 0;color:#506173;font-size:13px;}";
   html += "label{display:block;font-size:12px;font-weight:600;color:#506173;margin:10px 0 4px;}input{width:100%;padding:11px;border:1px solid #cfd8e3;border-radius:10px;font-size:14px;}input:focus{outline:none;border-color:#0f62fe;box-shadow:0 0 0 3px rgba(15,98,254,.15);}";
+  html += "input[type='range']{padding:0;height:8px;}.slider-label{display:flex;justify-content:space-between;}.slider-val{font-weight:700;color:#0f62fe;}";
   html += ".actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;}.btn{display:inline-block;padding:10px 16px;border-radius:10px;border:0;background:#0f62fe;color:#fff;font-weight:600;cursor:pointer;text-decoration:none;box-shadow:0 2px 6px rgba(15,98,254,.25);}";
   html += ".btn.secondary{background:#e9eef5;color:#1e2a38;}.btn.warn{background:#9f1239;color:#fff;}.notice{padding:10px 12px;border-radius:6px;margin-bottom:10px;font-size:13px;}";
   html += ".notice.ok{background:#e8f7ec;color:#185c37;border:1px solid #b8e0c2;}.notice.info{background:#eef4ff;color:#24417a;border:1px solid #c6d6fb;}";
   html += ".pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700;}.pill.ok{background:#dff7e8;color:#166534;}.pill.bad{background:#fee2e2;color:#991b1b;}.pill.wait{background:#fef3c7;color:#92400e;}";
   html += "details{background:#fff;border:1px solid #d8e0ea;border-radius:8px;padding:10px;}summary{font-weight:700;cursor:pointer;}pre{white-space:pre-wrap;background:#101820;color:#dbe2f0;padding:10px;border-radius:6px;max-height:300px;overflow:auto;font-size:12px;line-height:1.35;margin:0;}";
-  html += "@media (min-width:820px){.grid{grid-template-columns:1fr 1fr;} .wide{grid-column:1 / -1;}}</style></head><body><div class='wrap'><div class='grid'>";
+  html += "@media (min-width:820px){.grid{grid-template-columns:1fr 1fr;} .wide{grid-column:1 / -1;}}</style>";
+  html += "<script>function updateSliderVal(id,val){document.getElementById(id+'_val').textContent=val+' dBm';}</script>";
+  html += "</head><body><div class='wrap'><div class='grid'>";
 
   html += "<div class='panel wide'>";
   html += "<h1>BBH IoT Device</h1>";
@@ -1434,6 +1452,8 @@ void BbhIotFirmwareCore::handleLocalStatusPage() {
   html += "<input id='bs_pass' name='bs_pass' type='password' value='' maxlength='79' placeholder='Leave blank to keep saved password'>";
   html += "<label for='bs_interval'>Reading interval (minutes)</label>";
   html += "<input id='bs_interval' name='bs_interval' type='number' min='1' max='1440' value='" + String(readingIntervalMinutes_) + "' required>";
+  html += "<div class='slider-label'><label for='wifi_tx_pwr'>WiFi transmit power</label><span class='slider-val' id='wifi_tx_pwr_val'>" + String(wifiTxPower_) + " dBm</span></div>";
+  html += "<input id='wifi_tx_pwr' name='wifi_tx_pwr' type='range' min='20' max='82' value='" + String(wifiTxPower_) + "' onchange=\"updateSliderVal('wifi_tx_pwr')\" oninput=\"updateSliderVal('wifi_tx_pwr')\">";
   html += "<label for='loc_hint'>Location (optional)</label>";
   html += "<input id='loc_hint' name='loc_hint' value='" + htmlEscape(String(locationHint_)) + "' maxlength='63'>";
   html += "<div class='actions'><button class='btn' type='submit'>Save Bootstrap Settings</button></div>";
@@ -1532,6 +1552,15 @@ void BbhIotFirmwareCore::handleLocalSetupSave() {
     unsigned long mins = strtoul(intervalArg.c_str(), nullptr, 10);
     if (mins >= 1 && mins <= kMaxReadingMinutes) {
       readingIntervalMinutes_ = static_cast<uint16_t>(mins);
+    }
+  }
+
+  String wifiTxPwrArg = localServer_.arg("wifi_tx_pwr");
+  wifiTxPwrArg.trim();
+  if (wifiTxPwrArg.length() > 0) {
+    unsigned long pwr = strtoul(wifiTxPwrArg.c_str(), nullptr, 10);
+    if (pwr >= 20 && pwr <= 82) {
+      wifiTxPower_ = static_cast<uint8_t>(pwr);
     }
   }
 
