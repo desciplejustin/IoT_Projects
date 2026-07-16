@@ -544,7 +544,7 @@ bool BbhIotFirmwareCore::connectWifi() {
 }
 
 void BbhIotFirmwareCore::applyWifiPerformanceProfile() {
-  WiFi.setTxPower(wifiTxPower_ / 2.0f);
+  WiFi.setTxPower((wifi_power_t)(wifiTxPower_ / 2));
 #if BBH_WIFI_HIGH_PERFORMANCE
   // Keep the radio fully awake (no modem micro-naps) for stabler RSSI and faster
   // reconnects, and transmit at maximum power for better range. Higher idle
