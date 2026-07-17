@@ -205,33 +205,85 @@ Run the FIRMWARE_BASELINE.md checklist end-to-end, at minimum:
 - Local auth-protected status UI reachable and reflects live WiFi/MQTT/sensor state.
 - Factory reset clears WiFi + stored config and returns the device to bootstrap.
 
-## Backend & broker dependencies
+## Backend & broker dependencies (authoritative — from the BBH backend)
 
-The firmware side of onboarding is fully specified above and in CONTRACT.md. The
-matching **broker provisioning** and **backend approval** behavior is owned by the
-`bbh-app25.03` backend + the Mosquitto broker and must stay in lockstep. The items
-below are what a new device relies on; confirm/record them here as they're
-established so future projects inherit a complete picture:
+Broker provisioning + backend approval are owned by the `bbh-app25.03` backend
+(`iotMqttProvisioner.ts`, `iotMqttBootstrap.ts`, `controllers/iot.ts`) and the
+Mosquitto dynamic-security broker. Firmware must match these exactly.
 
-- **Broker environment matrix** — authoritative dev vs live broker host/port and
-  TLS status. (Known so far: dev `10.24.16.94`, live `10.24.16.176` (BeagleBone,
-  dynamic-security); firmware is `1883`-only, no TLS yet.)
-- **Bootstrap account ACL** — exact publish/subscribe grants the shared
-  `bbh-iot-bootstrap` account needs (`bbh/iot/bootstrap/claim` publish;
-  `bbh/iot/bootstrap/reply/{hardware_id}` subscribe).
-- **Per-device account ACL** — the read/write topic list provisioned on approval
-  (expected: publish `telemetry`/`status`/`state`, subscribe `command`/`config`
-  under `{topic_base}`). Firmware and broker ACL must agree exactly.
-- **Reply retention & lifecycle** — is the approved `device_config` published
-  **retained** (so a device reconnecting later still receives it)? What is the
-  operator pending→approved flow, and where is the `claim_code` entered?
-- **Topic prefix + canonical units** — confirm `IOT_MQTT_TOPIC_PREFIX = bbh/iot`
-  matches firmware, and the canonical unit set (`C`, `%`, `pH`, `mS/cm`).
-- **Sensor-type registration** — must new `sensor_type`s be pre-registered
-  backend-side before a claim carrying them will be approved, or are they created
-  from the claim?
-- **Re-bootstrap identity** — does the same `hardware_id` re-claim to the same
-  `device_key`, and is re-approval automatic or manual?
-- **Credential rotation** — the runtime `config` topic / `handleRuntimeConfigMessage`
-  rotation path and its message format (note: rotating a live device's credentials
-  must not de-register it — this has bitten us before).
+1. **Per-device ACL** (dynsec `deviceRoleAcls`; `topic_base = bbh/iot/{device_key}`):
+   - PUBLISH: `{topic_base}/telemetry`, `/status`, `/state`
+   - SUBSCRIBE + RECEIVE: `{topic_base}/command`, `/config`
+   - **Literal topics only — no wildcards, no cross-device access.** Firmware must
+     publish/subscribe exactly these.
+
+2. **Bootstrap account ACL** (shared account + client-id `bbh-iot-bootstrap`):
+   - PUBLISH: `bbh/iot/bootstrap/claim`
+   - SUBSCRIBE + RECEIVE: `bbh/iot/bootstrap/reply/#` (ACL grants the whole
+     namespace; firmware subscribes only its own `…/reply/{hardware_id}`).
+   - ⚠️ **Reply topic uses the SANITISED hardware_id** (every char outside
+     `[A-Za-z0-9._-]` → `-`), e.g. MAC `60:8C:9B:C1:3D:E8` →
+     `bbh/iot/bootstrap/reply/60-8C-9B-C1-3D-E8`. **Verified consistent:** the
+     firmware's `bootstrapReplyTopic()` = `sanitizeMqttToken(hardwareId())`
+     produces the dashed form and both subscribe (l.697) and message-match
+     (l.1168) use it. The claim *payload* still carries the colon MAC; both sides
+     sanitize independently. Don't "fix" this to colons — that would publish
+     claims fine but never see the reply (looks exactly like "backend not
+     responding").
+
+3. **Reply retention & operator flow**:
+   - pending `{kind:'claim_status',status:'pending',claim_code,…}` → QoS 1,
+     **retain=false**
+   - approved `{kind:'device_config',status:'approved',…}` → QoS 1, **retain=true**
+     (so a device reconnecting later still gets its config)
+   - Approval is **always MANUAL**, in the IoT app (Devices → pending-claims):
+     `POST /api/iot/v1/device-claims/{claim_id}/approve {device_name,
+     location_code?, notes?}`. Keyed by `claim_id` (UUID); the 6-digit `claim_code`
+     is only for visually matching the physical device.
+
+4. **Broker environment matrix** — both plaintext `:1883`, dynsec, prefix `bbh/iot`:
+   - **DEV**: WSL2 Mosquitto reached at the **Windows host LAN IP**, currently
+     **`10.24.16.105`** (LAN devices reach it via `netsh portproxy`).
+     ⚠️ **DHCP-volatile** — this IP moves; a stale value (`.94`) was the exact bug
+     behind a dead portproxy earlier. Firmware selects dev-vs-live by broker IP, so
+     keep the dev IP trivial to change and always point it at the host's *current*
+     LAN IP (or just set it in the setup portal, which overrides the compiled
+     default). See [dev broker IP](#dev-broker-ip-is-dhcp-volatile).
+   - **LIVE**: BeagleBone **`10.24.16.176`**, dynsec (TLS is the target, not yet
+     deployed).
+
+5. **Topic prefix + canonical units**: `IOT_MQTT_TOPIC_PREFIX = bbh/iot`; suffixes
+   `telemetry`/`status`/`state`/`command` + literal `config`. Canonical units
+   `C`, `%`, `pH`, `mS/cm` are **enforced at claim time** — a sensor with a
+   non-canonical unit is dropped, and a claim with zero valid sensors is rejected
+   outright. So a wrong `unit` in your sensor adapter silently kills onboarding.
+
+6. **Sensor-type registration** — **not pre-registered.** Approval inserts each
+   claim sensor into `iot_sensors` (`ON CONFLICT device_id+sensor_key DO UPDATE`).
+   `sensor_type` is free-text (no registry/FK); only `unit` must be canonical.
+   Thresholds default NULL; `sensor_name` defaults `"{device_name} {sensor_key}"`.
+
+7. **Re-bootstrap identity** — the same `hardware_id` re-claims to the **same**
+   `device_key`, and existing credentials are **reused** when recoverable (fresh
+   creds only for a brand-new device). Re-approval is still MANUAL.
+
+8. **Credential rotation** (`POST /device-claims … rotate` → `rotateDeviceToken`)
+   — graceful, never de-registers a live device:
+   - Requires the device **currently connected** (else `409`, nothing changes).
+   - Backend pushes a `device_config`-shaped message **plus top-level
+     `rotation_id`** to `{topic_base}/config` (QoS 1, retain=false).
+   - Firmware applies the new creds, then publishes to `{topic_base}/state`:
+     `{ "event": "config_applied", "rotation_id": "{same id}" }` (this is
+     `publishConfigAck()` — verified present).
+   - Backend swaps broker password + DB + retained reply **only after that ACK**;
+     no ACK within timeout ⇒ **full rollback**, device keeps old creds.
+
+### Dev broker IP is DHCP-volatile
+
+The dev broker is WSL2 Mosquitto behind the Windows host's LAN IP, which changes on
+DHCP renewal. The compiled `BBH_BOOTSTRAP_BROKER_HOST` in each dev `platformio.ini`
+is only a first-boot convenience — the setup portal's "MQTT broker IP" field
+overrides it at runtime and persists to NVS. When onboarding a fresh dev device and
+claims never get a reply, **first suspect a stale broker IP**: check the host's
+current LAN IP (`ipconfig` → the `10.24.16.x` address) and either set it in the
+portal or rebuild with the corrected `-D BBH_BOOTSTRAP_BROKER_HOST`.
