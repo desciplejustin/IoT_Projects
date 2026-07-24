@@ -98,11 +98,19 @@ bool isRuntimeAuthDenied(MQTTClient& client) {
 
 BbhIotFirmwareCore::BbhIotFirmwareCore(
     const BbhFirmwareCoreConfig& config,
-    BbhSensorAdapter& sensorAdapter)
+    BbhSensorAdapter& sensorAdapter,
+    BbhActuatorAdapter* actuatorAdapter)
     : config_(config),
       sensorAdapter_(sensorAdapter),
+      actuatorAdapter_(actuatorAdapter),
       localServer_(80),
-      mqtt_(1024, 1024),
+      // read=3072 comfortably holds the retained bootstrap device_config (~1.1 KB
+      // for a 4-sensor device) and the same-shaped runtime .../config rotation
+      // message. lwmqtt must fit the WHOLE incoming packet in the read buffer or
+      // it returns BUFFER_TOO_SHORT and drops the link before delivering it — the
+      // old 1024 silently blocked onboarding for devices whose config exceeded it.
+      // write=1024 is ample: publishes stream their payload after a short header.
+      mqtt_(3072, 1024),
       deviceMode_(DEVICE_MODE_BOOTSTRAP),
       localServerStarted_(false),
       resetPressActive_(false),
@@ -166,12 +174,26 @@ void BbhIotFirmwareCore::setup() {
   activeInstance = this;
   initializePins();
   initializeSensorDefinitions();
+
+  // Mount the filesystem FIRST. On ESP8266 the config store (BbhPreferences) is
+  // LittleFS-backed, so loadRuntimeConfig() / loadAndIncrementBootSeq() below must
+  // run with the FS already mounted — otherwise they read nothing, the device
+  // re-claims on every boot and boot_seq never advances. On ESP32 (Preferences =
+  // NVS, independent of LittleFS) mounting here early is simply harmless.
+  fsReady_ = bbhPlatformFsBegin();
+  if (!fsReady_) {
+    logEvent("Filesystem mount failed; config load + telemetry buffering unavailable.");
+  }
+
   loadRuntimeConfig();
   loadAndIncrementBootSeq();
   initTelemetryBuffer();
   deviceMode_ = hasFinalConfig() ? DEVICE_MODE_RUNTIME : DEVICE_MODE_BOOTSTRAP;
 
   sensorAdapter_.begin();
+  if (actuatorAdapter_ != nullptr) {
+    actuatorAdapter_->begin();  // drives all outputs to their OFF/safe state
+  }
   captureLatestReadings();
 
   if (!connectWifi()) {
@@ -190,6 +212,11 @@ void BbhIotFirmwareCore::setup() {
 
 void BbhIotFirmwareCore::loop() {
   handleFactoryResetButton();
+  if (actuatorAdapter_ != nullptr) {
+    // Render time-based output patterns (e.g. buzzer pulse cadence) every loop,
+    // independent of MQTT — a commanded-on buzzer keeps pulsing across a reconnect.
+    actuatorAdapter_->tick();
+  }
   if (localServerStarted_) {
     localServer_.handleClient();
   }
@@ -236,12 +263,34 @@ void BbhIotFirmwareCore::loop() {
       // Send live only when online AND the backlog is already empty, so buffered
       // records always drain in chronological (FIFO) order.
       bool sentLive = mqtt_.connected() && tbCount_ == 0 && publishTelemetryRecord(record);
+
+      // Human-readable summary of the readings this cycle, so the serial log
+      // shows every post at a glance (state units as 0/1, others to 2 dp;
+      // invalid readings flagged). captureLatestReadings() has just populated
+      // latestReadings_ via buildTelemetryRecord().
+      String summary;
+      for (size_t i = 0; i < latestReadingCount_; i++) {
+        if (summary.length()) {
+          summary += ", ";
+        }
+        summary += latestReadings_[i].sensorKey;
+        summary += '=';
+        bool isState = latestReadings_[i].unit && strcmp(latestReadings_[i].unit, "state") == 0;
+        summary += String(latestReadings_[i].value, isState ? 0 : 2);
+        if (!latestReadings_[i].valid) {
+          summary += "(invalid)";
+        }
+      }
+
       if (sentLive) {
         lastPublishSummary_ = "telemetry: ok";
+        logEvent("Telemetry posted -> " + String(runtimeTelemetryTopic_) + " : " + summary);
       } else if (telemetryBufferEnqueue(record)) {
         lastPublishSummary_ = String("telemetry: buffered (") + tbCount_ + " queued)";
+        logEvent("Telemetry buffered (" + String(tbCount_) + " queued) : " + summary);
       } else {
         lastPublishSummary_ = "telemetry: buffer unavailable, dropped";
+        logEvent("Telemetry dropped (buffer unavailable) : " + summary);
       }
     }
     lastTelemetryAt_ = millis();
@@ -253,8 +302,14 @@ void BbhIotFirmwareCore::loop() {
 }
 
 void BbhIotFirmwareCore::initializePins() {
-  pinMode(config_.pins.blueLedPin, OUTPUT);
-  pinMode(config_.pins.redLedPin, OUTPUT);
+  // A LED pin < 0 disables that core status LED — for devices that use their own
+  // indicator scheme (e.g. Project6 drives external power/WiFi LEDs from the sketch).
+  if (config_.pins.blueLedPin >= 0) {
+    pinMode(config_.pins.blueLedPin, OUTPUT);
+  }
+  if (config_.pins.redLedPin >= 0) {
+    pinMode(config_.pins.redLedPin, OUTPUT);
+  }
   pinMode(config_.pins.resetButtonPin, INPUT_PULLUP);
   setBlueLed(false);
   setRedLed(false);
@@ -546,15 +601,14 @@ bool BbhIotFirmwareCore::connectWifi() {
 }
 
 void BbhIotFirmwareCore::applyWifiPerformanceProfile() {
-  // wifi_power_t is in 0.25 dBm units, so multiply whole-dBm by 4 (e.g. 20 dBm
-  // -> 80 -> WIFI_POWER max bracket). esp_wifi_set_max_tx_power clamps to the
-  // nearest supported step.
-  WiFi.setTxPower((wifi_power_t)(wifiTxPower_ * 4));
+  // Whole-dBm TX power; the platform wrapper handles the per-chip API (ESP32
+  // wifi_power_t 0.25-dBm brackets vs ESP8266 setOutputPower in dBm).
+  bbhPlatformSetTxPowerDbm(wifiTxPower_);
 #if BBH_WIFI_HIGH_PERFORMANCE
   // Keep the radio fully awake (no modem micro-naps) for stabler RSSI and faster
   // reconnects, and transmit at maximum power for better range. Higher idle
   // current, so this is opt-in for devices where power is not a concern.
-  WiFi.setSleep(false);
+  bbhPlatformDisableModemSleep();
   static bool logged = false;
   if (!logged) {
     logged = true;
@@ -581,13 +635,19 @@ bool BbhIotFirmwareCore::runOnboardingPortal(bool forcePortal) {
   // power once the portal AP comes up — applyWifiPerformanceProfile() below
   // restores the full station profile after we join the real network.
   wm.setAPCallback([](WiFiManager*) {
-    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    bbhPlatformSetTxPowerApLow();
   });
 #endif
 
   // Modern look & feel for the captive setup portal. Injected into <head> so it
   // overrides WiFiManager's built-in styling.
-  static const char kPortalCss[] PROGMEM =
+  //
+  // NOT PROGMEM: WiFiManager's setCustomHeadElement(const char*) concatenates
+  // this into a String byte-by-byte when it renders the portal page. On ESP8266
+  // a byte read from flash-resident PROGMEM data faults (LoadStoreError / Exc 3),
+  // so this must live in byte-addressable .rodata (RAM on ESP8266). On ESP32
+  // PROGMEM is a no-op, so dropping it changes nothing there.
+  static const char kPortalCss[] =
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
       "<style>"
       ":root{--bbh:#0f62fe;}"
@@ -768,6 +828,19 @@ bool BbhIotFirmwareCore::connectRuntimeMqtt() {
     logEvent("Runtime config subscribe FAILED " + runtimeConfigTopic);
   }
 
+  // Actuator devices: subscribe to the command topic and publish current output
+  // state (retained) so the backend's current_state reflects reality after any
+  // (re)connect — including all-off at boot.
+  if (actuatorAdapter_ != nullptr) {
+    String runtimeCommandTopic = String(runtimeTopicBase_) + "/command";
+    if (mqtt_.subscribe(runtimeCommandTopic, runtimeQos_)) {
+      logEvent("Runtime command subscribe ok " + runtimeCommandTopic);
+    } else {
+      logEvent("Runtime command subscribe FAILED " + runtimeCommandTopic);
+    }
+    publishActuatorState(true);
+  }
+
   publishRuntimeStatus("online");
   setBlueLed(true);
   setRedLed(false);
@@ -804,6 +877,26 @@ void BbhIotFirmwareCore::publishBootstrapClaim() {
     sensor["sensor_key"] = sensorDefs_[i].sensorKey;
     sensor["sensor_type"] = sensorDefs_[i].sensorType;
     sensor["unit"] = sensorDefs_[i].unit;
+  }
+
+  // Actuator devices declare their outputs so the backend auto-registers them on
+  // approval (optional array; the claim is still gated on >=1 canonical sensor).
+  if (actuatorAdapter_ != nullptr) {
+    BbhActuatorDefinition actuatorDefs[kMaxActuators];
+    size_t actuatorCount = 0;
+    actuatorAdapter_->describeActuators(actuatorDefs, kMaxActuators, actuatorCount);
+    if (actuatorCount > kMaxActuators) {
+      actuatorCount = kMaxActuators;
+    }
+    if (actuatorCount > 0) {
+      JsonArray actuators = doc["actuators"].to<JsonArray>();
+      for (size_t i = 0; i < actuatorCount; i++) {
+        JsonObject a = actuators.add<JsonObject>();
+        a["actuator_key"] = actuatorDefs[i].actuatorKey;
+        a["actuator_name"] = actuatorDefs[i].actuatorName;
+        a["actuator_type"] = actuatorDefs[i].actuatorType;
+      }
+    }
   }
 
   String payload;
@@ -1001,7 +1094,9 @@ void BbhIotFirmwareCore::drainTelemetryBuffer(size_t maxRecords) {
 void BbhIotFirmwareCore::initTelemetryBuffer() {
   tbHead_ = 0;
   tbCount_ = 0;
-  fsReady_ = LittleFS.begin(true);  // format on first use / mount failure
+  if (!fsReady_) {
+    fsReady_ = bbhPlatformFsBegin();  // mount if setup() hasn't already
+  }
   if (!fsReady_) {
     logEvent("LittleFS mount failed; telemetry buffering disabled.");
     return;
@@ -1161,6 +1256,8 @@ void BbhIotFirmwareCore::onMqttMessage(String& topic, String& payload) {
   if (deviceMode_ == DEVICE_MODE_RUNTIME) {
     if (topic == String(runtimeTopicBase_) + "/config") {
       handleRuntimeConfigMessage(payload);
+    } else if (actuatorAdapter_ != nullptr && topic == String(runtimeTopicBase_) + "/command") {
+      handleActuatorCommand(payload);
     }
     return;
   }
@@ -1275,6 +1372,75 @@ void BbhIotFirmwareCore::publishConfigAck(const String& rotationId) {
   bool ok = mqtt_.publish(stateTopic, payload, false, runtimeQos_);
   mqtt_.loop();  // nudge the client to flush the ACK before the pending reconnect.
   logEvent(String("Config ACK ") + (ok ? "sent" : "failed") + " on " + stateTopic);
+}
+
+void BbhIotFirmwareCore::handleActuatorCommand(const String& payload) {
+  if (actuatorAdapter_ == nullptr) {
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, payload) != DeserializationError::Ok) {
+    logEvent("Actuator command parse failed.");
+    return;
+  }
+
+  String type = String((const char*)(doc["type"] | ""));
+  if (type != "actuator_command") {
+    logEvent("Command ignored: type is not actuator_command.");
+    return;
+  }
+
+  const char* actuatorKey = doc["actuator_key"] | "";
+  const char* command = doc["command"] | "";
+  const char* value = doc["value"] | "";  // backend sends string|null; "" when null
+  if (isBlank(actuatorKey) || isBlank(command)) {
+    logEvent("Command ignored: missing actuator_key/command.");
+    return;
+  }
+
+  bool matched = actuatorAdapter_->applyCommand(actuatorKey, command, value);
+  logEvent(String("Actuator command ") + actuatorKey + " -> " + command +
+           (isBlank(value) ? "" : (String(" (") + value + ")")) +
+           (matched ? " applied" : " (unknown key)"));
+
+  // ACK only a recognised command: publishing state closes the outstanding
+  // command_id and updates current_state on the backend (it reconciles by
+  // actuator_key, not command_id). An unknown key leaves the command open.
+  if (matched) {
+    publishActuatorState(true);
+  }
+}
+
+void BbhIotFirmwareCore::publishActuatorState(bool retain) {
+  if (actuatorAdapter_ == nullptr || !mqtt_.connected() || isBlank(runtimeTopicBase_)) {
+    return;
+  }
+
+  BbhActuatorState states[kMaxActuators];
+  size_t count = 0;
+  actuatorAdapter_->reportState(states, kMaxActuators, count);
+  if (count > kMaxActuators) {
+    count = kMaxActuators;
+  }
+
+  JsonDocument doc;
+  JsonArray actuators = doc["actuators"].to<JsonArray>();
+  for (size_t i = 0; i < count; i++) {
+    JsonObject a = actuators.add<JsonObject>();
+    a["actuator_key"] = states[i].actuatorKey;
+    a["state"] = states[i].state;
+  }
+  if (isTimeValid()) {
+    doc["reported_at"] = currentIso8601();
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+  String stateTopic = String(runtimeTopicBase_) + "/state";
+  bool ok = mqtt_.publish(stateTopic, payload, retain, runtimeQos_);
+  mqtt_.loop();  // flush the ACK promptly
+  logEvent(String("Actuator state ") + (ok ? "published" : "failed") + " (" + count +
+           ") on " + stateTopic);
 }
 
 void BbhIotFirmwareCore::ensureLocalServer() {
@@ -1630,7 +1796,10 @@ void BbhIotFirmwareCore::requestMqttReconnect(const String& reason) {
 }
 
 void BbhIotFirmwareCore::logEvent(const String& message) {
-  String line = String(millis()) + "ms " + message;
+  // Prefer a real UTC wall-clock timestamp once NTP has resolved; fall back to
+  // uptime millis before then (and if the clock is ever lost).
+  String prefix = isTimeValid() ? (currentIso8601() + " ") : (String(millis()) + "ms ");
+  String line = prefix + message;
   Serial.println(line);
   eventLog_[eventLogHead_] = line;
   eventLogHead_ = (eventLogHead_ + 1) % kLogCapacity;
@@ -1640,22 +1809,22 @@ void BbhIotFirmwareCore::logEvent(const String& message) {
 }
 
 void BbhIotFirmwareCore::setBlueLed(bool on) {
+  if (config_.pins.blueLedPin < 0) {
+    return;
+  }
   digitalWrite(config_.pins.blueLedPin, on ? HIGH : LOW);
 }
 
 void BbhIotFirmwareCore::setRedLed(bool on) {
+  if (config_.pins.redLedPin < 0) {
+    return;
+  }
   digitalWrite(config_.pins.redLedPin, on ? HIGH : LOW);
 }
 
 String BbhIotFirmwareCore::hardwareId() const {
-  uint64_t mac = ESP.getEfuseMac();
-  uint8_t bytes[6] = {
-      static_cast<uint8_t>(mac >> 40),
-      static_cast<uint8_t>(mac >> 32),
-      static_cast<uint8_t>(mac >> 24),
-      static_cast<uint8_t>(mac >> 16),
-      static_cast<uint8_t>(mac >> 8),
-      static_cast<uint8_t>(mac)};
+  uint8_t bytes[6];
+  bbhPlatformMacBytes(bytes);  // per-chip MAC source; ESP32 order preserved
   char out[18];
   snprintf(out, sizeof(out), "%02X:%02X:%02X:%02X:%02X:%02X", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
   return String(out);

@@ -33,7 +33,7 @@ the `bbh-app25.03` backend. It is derived from the running code on both sides:
 | `{prefix}/{device_key}/status`    | device → backend | no | JSON heartbeat |
 | `{prefix}/{device_key}/command`   | backend → device | no | actuator commands (see Actuator control) |
 | `{prefix}/{device_key}/state`     | device → backend | yes (recommended) | actuator state reports |
-| `{prefix}/{device_key}/config`    | backend → device | — | reserved (not yet consumed by firmware) |
+| `{prefix}/{device_key}/config`    | backend → device | — | credential rotation push (consumed by firmware) |
 | `bbh/iot/bootstrap/claim`         | device → backend | no | unprovisioned device claim |
 | `bbh/iot/bootstrap/reply/{hardware_id}` | backend → device | see note | claim status / approved config |
 
@@ -42,9 +42,10 @@ Notes:
 - **There is no `ota` topic yet.** Device availability (online/offline) is computed
   server-side from `iot_devices.last_seen` + `offline_after_minutes` — the `state` topic is
   for **actuator** state, not device availability.
-- The `command` and `state` topics are consumed by the backend now (for switches/relays),
-  but the **device firmware does not yet act on commands or publish state** — that is the
-  pending actuator-firmware work. Until then commands publish but go unconfirmed.
+- The `command` and `state` topics are live end-to-end: the backend publishes
+  `actuator_command`s and the **device firmware acts on them and ACKs on `state`**
+  (implemented in the shared core; first device = Project6-UV-Indicator). See
+  *Actuator control*.
 - `hardware_id` in the reply topic is the device MAC, sanitized so every run of characters
   outside `[A-Za-z0-9._-]` collapses to a single `-`. Firmware and backend sanitize
   identically, so `AA:BB:CC...` → `AA-BB-CC...` on both ends.
@@ -71,7 +72,8 @@ Rules:
 - `reading_type` is **not** part of the telemetry payload. The backend takes the reading
   type from the registered sensor row (`iot_sensors.sensor_type`), not the message.
 - `value` must be a finite number. `unit` must be canonical **and** match the sensor's
-  configured unit.
+  configured unit. For the `state` unit, `value` must be exactly `0` or `1` (see
+  *Canonical units → `state`*).
 - `message_id` **must be globally unique per (device, sensor) over the lifetime of the
   device**, including across reboots. The backend enforces a unique index on
   `(device_id, sensor_id, ingest_message_id)` and silently drops conflicts via
@@ -96,7 +98,32 @@ flush. When the buffer is full the oldest record is dropped to make room for the
 
 ### Canonical units
 
-`C`, `%`, `pH`, `mS/cm`. Anything else is quarantined as `invalid_unit`.
+`C`, `%`, `pH`, `mS/cm`, `state`. Anything else is quarantined as `invalid_unit`.
+
+**`state` — discrete boolean sample.** For monitored digital inputs (contactor
+open/closed, door, relay/aux dry-contact, float switch) that have no natural
+engineering unit. `value` MUST be exactly `0` or `1`:
+
+- `1` = active / closed / energized / present
+- `0` = inactive / open / de-energized / absent
+
+The `sensor_type` free-text names the physical thing (`contactor`, `door`,
+`float_switch`, …); the precise polarity meaning lives in that `sensor_type` plus
+the device's `PROJECT.md`, not in the unit. A `state` reading flows through the
+**normal telemetry pipeline** — same `…/telemetry` topic, `message_id` dedup,
+store-and-forward, `reading_time` — because it is a *sampled observation of an
+input*. This is deliberately distinct from the actuator `…/state` topic, which
+reports *outputs the device drives*. Backends SHOULD treat a `state` sensor's
+history as a step series and MAY alert on transitions (e.g. a contactor expected
+closed that reads `0`).
+
+> **Backend support required (additive).** The `state` unit must be added to the
+> backend's canonical-unit whitelist (`bbh-app25.03`) before a device declaring it
+> will onboard — until then such a sensor is dropped as `invalid_unit` and a claim
+> with only `state` sensors is rejected. **No broker change is needed:** `state`
+> readings publish on the existing `{topic_base}/telemetry` topic already granted
+> by the per-device ACL; Mosquitto never inspects payloads or units. See the
+> backend task doc for the exact change.
 
 ### Backend deduplication
 
@@ -141,11 +168,21 @@ online/offline is still derived server-side from `last_seen` + `offline_after_mi
      "ip_address": "10.24.16.41",
      "sensors": [
        { "sensor_key": "probe_1", "sensor_type": "temperature", "unit": "C" }
+     ],
+     "actuators": [
+       { "actuator_key": "relay_1", "actuator_name": "Alarm Light", "actuator_type": "relay" }
      ]
    }
    ```
 
-   `hardware_id` and at least one valid sensor (canonical unit) are required.
+   `hardware_id` and **at least one valid sensor** (canonical unit) are required — a
+   claim with zero canonical-unit sensors is rejected outright, even if it declares
+   actuators. The `actuators[]` array is **optional** (omit it for sensor-only
+   devices); when present the backend auto-registers each actuator on approval.
+   Rules: a hint with a blank `actuator_key` is dropped; an unknown `actuator_type`
+   falls back to `relay` (it is a UI hint only); each actuator's feedback
+   `sensor_key` (e.g. `relay_1_state`) must stay distinct from its output
+   `actuator_key` (e.g. `relay_1`).
 
 2. The backend replies on `bbh/iot/bootstrap/reply/{hardware_id}` with a **pending** status:
 
@@ -212,12 +249,17 @@ resulting state back.
 ```
 
 - The backend updates each actuator's `current_state` from this report and marks the
-  outstanding command for that actuator as acknowledged.
+  outstanding command for that actuator as acknowledged (it reconciles by `actuator_key`,
+  not `command_id`).
 - The device ACL grants write on `{topic_base}/state` and read on `{topic_base}/command`.
 
-> **Deferred:** firmware does not yet subscribe to `command` or publish `state`. Until that
-> ships, the app records `desired_state` and publishes commands, but `current_state` stays
-> unconfirmed.
+**Firmware behaviour (shared core):** a device constructed with a `BbhActuatorAdapter`
+declares its outputs in the bootstrap claim's `actuators[]` (so they auto-register on
+approval — see *Bootstrap / claim flow*), subscribes to `{topic_base}/command` on every
+runtime (re)connect, applies each `actuator_command`, and publishes the full actuator set
+to `{topic_base}/state` (retain=true) both on connect (so `current_state` reflects boot
+state) and after each command. First consumer: Project6-UV-Indicator (4 relays + 2
+buzzers).
 
 ## Security posture (current)
 

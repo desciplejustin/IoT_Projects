@@ -3,9 +3,12 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <MQTT.h>
-#include <Preferences.h>
-#include <WebServer.h>
-#include <WiFi.h>
+
+// Chip-family differences (persistence, web server, WiFi, MAC, FS) are resolved
+// here at compile time. This pulls in the right WiFi/WebServer/Preferences
+// headers for the target, so include it before WiFiManager (which needs WiFi.h).
+#include "platform/platform_compat.h"
+
 #include <WiFiManager.h>
 
 struct BbhSensorDefinition {
@@ -27,6 +30,52 @@ class BbhSensorAdapter {
   virtual void begin() = 0;
   virtual void describeSensors(BbhSensorDefinition* definitions, size_t maxCount, size_t& outCount) = 0;
   virtual void readTelemetry(BbhTelemetryReading* readings, size_t maxCount, size_t& outCount) = 0;
+};
+
+// Declaration of one controllable output, sent in the bootstrap claim's
+// `actuators[]` so the backend auto-registers it on approval (no manual Controls
+// creation). `actuatorKey` is the id the firmware answers commands on and MUST be
+// distinct from any feedback sensor_key; `actuatorName` is the human label; an
+// unrecognised `actuatorType` falls back to "relay" backend-side (UI hint only).
+struct BbhActuatorDefinition {
+  const char* actuatorKey;
+  const char* actuatorName;
+  const char* actuatorType;
+};
+
+// Reported state of one controllable output, for the device -> backend ACK on
+// `{topic_base}/state`. `state` is a stable string the backend stores verbatim as
+// the actuator's current_state ("on"/"off"); point it at a string literal or
+// long-lived buffer owned by the adapter.
+struct BbhActuatorState {
+  const char* actuatorKey;
+  const char* state;
+};
+
+// Optional device outputs (relays, buzzers, indicator lights the BACKEND drives).
+// Control is asymmetric per CONTRACT.md -> Actuator control: the backend publishes
+// an `actuator_command` to `{topic_base}/command`, the device applies it and reports
+// the resulting state on `{topic_base}/state`. Actuators are NOT declared in the
+// bootstrap claim; an operator creates them in the Controls UI keyed by the same
+// `actuatorKey` strings the firmware answers to (document them in PROJECT.md). A
+// device with no outputs simply omits an adapter (the sensor-only constructor).
+class BbhActuatorAdapter {
+ public:
+  virtual ~BbhActuatorAdapter() = default;
+  virtual void begin() = 0;
+  // Declare every controllable output for the bootstrap claim's `actuators[]`.
+  // Set outCount to the number written.
+  virtual void describeActuators(BbhActuatorDefinition* out, size_t maxCount, size_t& outCount) = 0;
+  // Apply a command to `actuatorKey`. `command` is "on"/"off"/"set"; `value` is the
+  // (possibly empty) command value, e.g. a level for "set". Return true if the key
+  // matched a known actuator (so the core knows to ACK); false = unknown key.
+  virtual bool applyCommand(const char* actuatorKey, const char* command, const char* value) = 0;
+  // Fill the current state of every actuator (for the command ACK + the retained
+  // state published on connect). Set outCount to the number written.
+  virtual void reportState(BbhActuatorState* out, size_t maxCount, size_t& outCount) = 0;
+  // Non-blocking render tick, called every loop() — drive time-based output
+  // patterns here (e.g. a buzzer's on/off pulse cadence). MUST NOT block.
+  virtual void tick() {}
 };
 
 struct BbhBootstrapDefaults {
@@ -73,14 +122,26 @@ struct BbhFirmwareCoreConfig {
 
 class BbhIotFirmwareCore {
  public:
-  BbhIotFirmwareCore(const BbhFirmwareCoreConfig& config, BbhSensorAdapter& sensorAdapter);
+  // Sensor-only device (no controllable outputs) — unchanged from earlier projects.
+  BbhIotFirmwareCore(const BbhFirmwareCoreConfig& config, BbhSensorAdapter& sensorAdapter)
+      : BbhIotFirmwareCore(config, sensorAdapter, nullptr) {}
+  // Device with actuators (relays/buzzers/lights the backend controls). See
+  // BbhActuatorAdapter; Project6-UV-Indicator is the first consumer.
+  BbhIotFirmwareCore(const BbhFirmwareCoreConfig& config, BbhSensorAdapter& sensorAdapter,
+                     BbhActuatorAdapter& actuatorAdapter)
+      : BbhIotFirmwareCore(config, sensorAdapter, &actuatorAdapter) {}
 
   void setup();
   void loop();
 
  private:
+  // Designated constructor; a null actuatorAdapter means a sensor-only device.
+  BbhIotFirmwareCore(const BbhFirmwareCoreConfig& config, BbhSensorAdapter& sensorAdapter,
+                     BbhActuatorAdapter* actuatorAdapter);
+
   static constexpr size_t kLogCapacity = 50;
   static constexpr size_t kMaxSensors = 8;
+  static constexpr size_t kMaxActuators = 8;
   static constexpr size_t kHostMax = 80;
   static constexpr size_t kUserMax = 64;
   static constexpr size_t kPassMax = 80;
@@ -136,6 +197,8 @@ class BbhIotFirmwareCore {
   void publishBootstrapClaim();
   bool applyApprovedConfig(JsonDocument& doc);
   void handleRuntimeConfigMessage(const String& payload);
+  void handleActuatorCommand(const String& payload);
+  void publishActuatorState(bool retain);
   void publishConfigAck(const String& rotationId);
   void publishRuntimeStatus(const char* state);
   bool buildTelemetryRecord(String& outJson);
@@ -179,10 +242,17 @@ class BbhIotFirmwareCore {
 
   const BbhFirmwareCoreConfig& config_;
   BbhSensorAdapter& sensorAdapter_;
+  BbhActuatorAdapter* actuatorAdapter_;  // null for sensor-only devices
 
-  Preferences configStore_;
-  WebServer localServer_;
+  BbhPreferences configStore_;
+  BbhWebServer localServer_;
   WiFiClient net_;
+  // Read/write buffer sizes are set in the constructor init list — mqtt_(read,
+  // write) — NOT here (an init-list entry overrides any default member init).
+  // Read must fit an ENTIRE incoming packet: the retained bootstrap
+  // `device_config` runs ~1.1 KB for a 4-sensor device, so the read buffer is
+  // sized well above that. Writes stream their payload after a short header, so
+  // the write buffer only needs header+topic room.
   MQTTClient mqtt_;
 
   DeviceMode deviceMode_;

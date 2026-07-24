@@ -36,6 +36,24 @@
       "platform": "espressif32",
       "framework": "arduino",
       "defaultEnv": "c3_app"
+    },
+    {
+      "name": "Project5-UV-Monitor",
+      "path": "Project5-UV-Monitor",
+      "description": "ESP8266 NodeMCU 4-contactor open/closed state monitor (debounced discrete `state` sensors, bootstrap/claim provisioning)",
+      "board": "nodemcuv2",
+      "platform": "espressif8266",
+      "framework": "arduino",
+      "defaultEnv": "uvmon_app"
+    },
+    {
+      "name": "Project6-UV-Indicator",
+      "path": "Project6-UV-Indicator",
+      "description": "ESP32 WROOM-32 actuator/annunciator panel: 4 relays + 2 buzzers driven by backend actuator_commands (first consumer of the core actuator path), 2 status LEDs, relay-position `state` sensors for onboarding",
+      "board": "esp32dev",
+      "platform": "espressif32",
+      "framework": "arduino",
+      "defaultEnv": "uvind_app"
     }
   ]
 }
